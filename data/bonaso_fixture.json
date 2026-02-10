@@ -3290,7 +3290,7 @@
     "pk": 67,
     "fields": {
       "name": "Total Number of People Reached with Condom Use Messages",
-      "code": "TOTAL_NUMBER_OF_PEOPLE_REACHED_WITH_CONDOM_USE_MESSAGES",
+      "code": "TOTAL_NUMBER_OF_PEOPLE_REACHED_WITH_COND04550ae8",
       "description": "",
       "type": "number",
       "category": "hiv_prevention",
@@ -3316,7 +3316,7 @@
     "pk": 68,
     "fields": {
       "name": "Total Number of People Reached with HIV Treatment Messages",
-      "code": "TOTAL_NUMBER_OF_PEOPLE_REACHED_WITH_HIV_TREATMENT_MESSAGES",
+      "code": "TOTAL_NUMBER_OF_PEOPLE_REACHED_WITH_HIV_41644ee4",
       "description": "",
       "type": "number",
       "category": "hiv_prevention",
@@ -3342,7 +3342,7 @@
     "pk": 69,
     "fields": {
       "name": "Total Number of People Reached with ARV Based Prevention Messages",
-      "code": "TOTAL_NUMBER_OF_PEOPLE_REACHED_WITH_ARV_BASED_PREVENTION_MESSAGES",
+      "code": "TOTAL_NUMBER_OF_PEOPLE_REACHED_WITH_ARV_6433504c",
       "description": "",
       "type": "number",
       "category": "events",
