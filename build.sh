@@ -8,6 +8,16 @@ pip install -r requirements.txt
 echo "Running migrations..."
 python manage.py migrate --noinput
 
+if [[ "${LOAD_FIXTURE:-False}" == "True" ]]; then
+  FIXTURE_PATH="${FIXTURE_PATH:-data/bonaso_fixture.json}"
+  if [[ -f "${FIXTURE_PATH}" ]]; then
+    echo "Loading fixture ${FIXTURE_PATH}..."
+    python manage.py loaddata "${FIXTURE_PATH}"
+  else
+    echo "Fixture not found: ${FIXTURE_PATH}"
+  fi
+fi
+
 if [[ -n "${ADMIN_USERNAME:-}" && -n "${ADMIN_PASSWORD:-}" ]]; then
   echo "Ensuring admin user..."
   python manage.py shell -c "from django.contrib.auth import get_user_model; \
