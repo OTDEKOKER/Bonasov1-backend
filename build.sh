@@ -20,5 +20,21 @@ u.save(); \
 print('Admin user ready:', u.username, 'created' if created else 'updated')"
 fi
 
+if [[ "${ACTIVATE_ALL_USERS:-False}" == "True" ]]; then
+  echo "Activating all users..."
+  python manage.py shell -c "from django.contrib.auth import get_user_model; \
+U=get_user_model(); \
+updated = U.objects.filter(is_active=False).update(is_active=True); \
+print('Activated users:', updated)"
+fi
+
+if [[ "${GRANT_ADMIN_ROLE_SUPERUSER:-False}" == "True" ]]; then
+  echo "Granting admin role users staff/superuser..."
+  python manage.py shell -c "from django.contrib.auth import get_user_model; \
+U=get_user_model(); \
+updated = U.objects.filter(role='admin').update(is_staff=True, is_superuser=True, is_active=True); \
+print('Updated admin role users:', updated)"
+fi
+
 echo "Collecting static files..."
 python manage.py collectstatic --noinput
