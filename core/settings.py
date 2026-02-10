@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import timedelta
 import os
 from dotenv import load_dotenv
+import dj_database_url
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -84,9 +85,18 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'core.wsgi.application'
 
-# Database - Uses SQLite by default for easy local development
-# Set USE_POSTGRES=True in .env to use PostgreSQL
-if os.getenv('USE_POSTGRES', 'False').lower() == 'true':
+# Database
+# Priority: DATABASE_URL -> USE_POSTGRES -> SQLite
+database_url = os.getenv('DATABASE_URL')
+if database_url:
+    DATABASES = {
+        'default': dj_database_url.parse(
+            database_url,
+            conn_max_age=600,
+            ssl_require=os.getenv('DB_SSL_REQUIRE', 'True').lower() == 'true',
+        )
+    }
+elif os.getenv('USE_POSTGRES', 'False').lower() == 'true':
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
