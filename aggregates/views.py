@@ -9,6 +9,7 @@ from django.db.models import Sum
 from django.utils import timezone
 from django.http import HttpResponse
 import csv
+import json
 from io import BytesIO
 
 from .models import Aggregate
@@ -172,14 +173,31 @@ class AggregateViewSet(viewsets.ModelViewSet):
 
         rows = []
         for agg in queryset:
+            value = agg.value
+            male = None
+            female = None
+            total = None
+            if isinstance(value, dict):
+                male = value.get('male')
+                female = value.get('female')
+                total = value.get('total')
+            elif isinstance(value, (int, float)):
+                total = value
+
             rows.append({
-                'indicator': agg.indicator.name if agg.indicator_id else '',
+                'indicator_id': agg.indicator_id or '',
+                'indicator_name': agg.indicator.name if agg.indicator_id else '',
                 'indicator_code': agg.indicator.code if agg.indicator_id else '',
-                'project': agg.project.name if agg.project_id else '',
-                'organization': agg.organization.name if agg.organization_id else '',
+                'project_id': agg.project_id or '',
+                'project_name': agg.project.name if agg.project_id else '',
+                'organization_id': agg.organization_id or '',
+                'organization_name': agg.organization.name if agg.organization_id else '',
                 'period_start': agg.period_start.isoformat(),
                 'period_end': agg.period_end.isoformat(),
-                'value': agg.value,
+                'male': male if male is not None else '',
+                'female': female if female is not None else '',
+                'total': total if total is not None else '',
+                'value_json': json.dumps(value, ensure_ascii=False) if value is not None else '',
                 'notes': agg.notes or '',
             })
 
