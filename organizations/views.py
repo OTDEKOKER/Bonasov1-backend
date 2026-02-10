@@ -25,7 +25,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Organization.objects.all()
         elif user.organization:
             # Return user's org and its descendants
