@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status
+﻿from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -24,7 +24,7 @@ class FlagViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Flag.objects.all()
         elif user.organization:
             return Flag.objects.filter(organization=user.organization)
@@ -92,3 +92,4 @@ class FlagCommentViewSet(viewsets.ModelViewSet):
     
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+

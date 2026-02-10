@@ -38,6 +38,10 @@ class UserCreateSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         if attrs.get('password') != attrs.get('password_confirm'):
             raise serializers.ValidationError({'password_confirm': "Passwords don't match."})
+        role = attrs.get('role')
+        organization = attrs.get('organization')
+        if role in {'manager', 'officer', 'collector', 'client'} and not organization:
+            raise serializers.ValidationError({'organization': 'Organization is required for this role.'})
         return attrs
     
     def create(self, validated_data):
@@ -58,6 +62,13 @@ class UserUpdateSerializer(serializers.ModelSerializer):
             'first_name', 'last_name', 'email', 'role', 'organization', 
             'phone', 'avatar', 'is_active'
         ]
+
+    def validate(self, attrs):
+        role = attrs.get('role', getattr(self.instance, 'role', None))
+        organization = attrs.get('organization', getattr(self.instance, 'organization', None))
+        if role in {'manager', 'officer', 'collector', 'client'} and not organization:
+            raise serializers.ValidationError({'organization': 'Organization is required for this role.'})
+        return attrs
 
 
 class PasswordChangeSerializer(serializers.Serializer):

@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status
+﻿from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -33,7 +33,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Project.objects.all()
         elif user.organization:
             return Project.objects.filter(
@@ -129,7 +129,7 @@ class TaskViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Task.objects.all()
         elif user.organization:
             return Task.objects.filter(project__organizations=user.organization)
@@ -162,7 +162,7 @@ class DeadlineViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Deadline.objects.all()
         elif user.organization:
             return Deadline.objects.filter(project__organizations=user.organization)
@@ -188,3 +188,4 @@ class DeadlineViewSet(viewsets.ModelViewSet):
         deadline.submitted_by = request.user
         deadline.save()
         return Response(DeadlineSerializer(deadline).data)
+

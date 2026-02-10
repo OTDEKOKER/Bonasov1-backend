@@ -1,4 +1,4 @@
-from rest_framework import viewsets
+﻿from rest_framework import viewsets
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
@@ -21,7 +21,7 @@ class SocialPostViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return SocialPost.objects.all()
         elif user.organization:
             return SocialPost.objects.filter(organization=user.organization)
@@ -29,3 +29,4 @@ class SocialPostViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+

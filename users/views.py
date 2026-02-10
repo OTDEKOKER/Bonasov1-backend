@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status, generics
+﻿from rest_framework import viewsets, status, generics
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.permissions import IsAuthenticated, AllowAny, IsAdminUser
 from rest_framework.response import Response
@@ -143,7 +143,7 @@ class UserViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Filter queryset based on user role."""
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return User.objects.all()
         elif user.role == 'manager':
             return User.objects.filter(organization=user.organization)
@@ -185,3 +185,4 @@ class UserActivityViewSet(viewsets.ReadOnlyModelViewSet):
     filter_backends = [DjangoFilterBackend, OrderingFilter]
     filterset_fields = ['user', 'action', 'model_name']
     ordering = ['-timestamp']
+

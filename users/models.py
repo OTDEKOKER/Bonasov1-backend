@@ -9,6 +9,7 @@ class User(AbstractUser):
         ('admin', 'Admin'),
         ('manager', 'M&E Manager'),
         ('officer', 'M&E Officer'),
+        ('collector', 'Data Collector'),
         ('client', 'Client'),
     ]
     

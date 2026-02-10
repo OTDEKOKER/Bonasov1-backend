@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status
+﻿from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -26,7 +26,7 @@ class IndicatorViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Indicator.objects.all()
         elif user.organization:
             return Indicator.objects.filter(
@@ -75,7 +75,7 @@ class AssessmentViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Assessment.objects.all()
         elif user.organization:
             return Assessment.objects.filter(
@@ -127,3 +127,4 @@ class AssessmentViewSet(viewsets.ModelViewSet):
             indicator_id=indicator_id
         ).delete()
         return Response({'detail': 'Indicator removed from assessment.'})
+

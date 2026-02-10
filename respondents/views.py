@@ -1,4 +1,4 @@
-# respondents/views.py
+﻿# respondents/views.py
 
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -35,7 +35,7 @@ class RespondentViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Filter queryset by user role and organization."""
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Respondent.objects.all()
         elif user.organization:
             return Respondent.objects.filter(organization=user.organization)
@@ -106,7 +106,7 @@ class InteractionViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Filter interactions by user role and organization."""
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Interaction.objects.all()
         elif user.organization:
             return Interaction.objects.filter(respondent__organization=user.organization)
@@ -136,3 +136,4 @@ class ResponseViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['interaction', 'indicator']
+

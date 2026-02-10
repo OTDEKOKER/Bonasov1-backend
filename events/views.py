@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status
+﻿from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
@@ -35,7 +35,7 @@ class EventViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Event.objects.all()
         elif user.organization:
             return Event.objects.filter(organization=user.organization)
@@ -182,3 +182,4 @@ class EventCheckinViewSet(viewsets.ViewSet):
         event.actual_participants = event.participants.filter(attended=True).count()
         event.save()
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+

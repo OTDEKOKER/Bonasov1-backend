@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status
+﻿from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -30,7 +30,7 @@ class AggregateViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Aggregate.objects.all()
         elif user.organization:
             return Aggregate.objects.filter(organization=user.organization)
@@ -214,3 +214,4 @@ class AggregateViewSet(viewsets.ModelViewSet):
             for row in rows:
                 writer.writerow(row.values())
         return response
+

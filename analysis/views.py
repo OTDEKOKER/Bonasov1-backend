@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status
+﻿from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -229,7 +229,7 @@ class ReportViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Report.objects.all()
         return Report.objects.filter(
             models.Q(organization=user.organization) |
@@ -416,7 +416,7 @@ class ScheduledReportViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return ScheduledReport.objects.all()
         return ScheduledReport.objects.filter(created_by=user)
 
@@ -441,7 +441,7 @@ class DashboardView(viewsets.ViewSet):
         user = request.user
         
         # Build base querysets based on user role
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             respondents = Respondent.objects.all()
             interactions = Interaction.objects.all()
             projects = Project.objects.all()
@@ -462,3 +462,4 @@ class DashboardView(viewsets.ViewSet):
             'indicators_behind': 0,  # Calculate based on project targets
             'recent_activity': [],
         })
+

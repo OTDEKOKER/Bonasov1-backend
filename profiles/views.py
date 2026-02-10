@@ -1,4 +1,4 @@
-from rest_framework import viewsets
+﻿from rest_framework import viewsets
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 
@@ -17,7 +17,7 @@ class ProfileViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return Profile.objects.all()
         elif user.organization:
             return Profile.objects.filter(respondent__organization=user.organization)
@@ -35,9 +35,10 @@ class ProfileFieldViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.is_superuser or user.is_staff or user.role == 'admin':
             return ProfileField.objects.all()
         return ProfileField.objects.filter(
             models.Q(organization=user.organization) |
             models.Q(organization__isnull=True)
         )
+
