@@ -15,6 +15,7 @@ from io import BytesIO
 from .models import Aggregate, AggregateChangeLog, DerivationRule
 from .serializers import (
     AggregateFlagSerializer,
+    AggregateListSerializer,
     AggregateSerializer,
     AggregateReviewSerializer,
     DerivationRuleSerializer,
@@ -32,7 +33,7 @@ class AggregateViewSet(viewsets.ModelViewSet):
     """ViewSet for managing aggregate data."""
     
     queryset = Aggregate.objects.all()
-    serializer_class = AggregateSerializer
+    serializer_class = AggregateListSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, OrderingFilter]
     filterset_fields = ['indicator', 'project', 'organization', 'period_start', 'period_end', 'status', 'reviewed_by']
@@ -230,7 +231,9 @@ class AggregateViewSet(viewsets.ModelViewSet):
             'organization',
             'created_by',
             'reviewed_by',
-        ).prefetch_related('history_entries__changed_by')
+        )
+        if self.action == 'retrieve':
+            base_queryset = base_queryset.prefetch_related('history_entries__changed_by')
         if is_platform_admin(user):
             return base_queryset
         elif getattr(user, 'role', None) == 'manager' and user.organization:
@@ -238,6 +241,11 @@ class AggregateViewSet(viewsets.ModelViewSet):
         elif user.organization:
             return base_queryset.filter(organization=user.organization)
         return base_queryset.none()
+
+    def get_serializer_class(self):
+        if self.action == 'retrieve':
+            return AggregateSerializer
+        return super().get_serializer_class()
     
     def perform_create(self, serializer):
         organization_id = serializer.validated_data.get('organization').id
@@ -422,7 +430,7 @@ class AggregateViewSet(viewsets.ModelViewSet):
                 comment='Aggregate generated from interactions and submitted for coordinator review.',
                 changes=self._build_change_set({}, self._snapshot_aggregate(aggregate)) if created else {},
             )
-            aggregate_data = AggregateSerializer(aggregate).data
+            aggregate_data = AggregateListSerializer(aggregate).data
 
         return Response(
             {
@@ -457,7 +465,7 @@ class AggregateViewSet(viewsets.ModelViewSet):
             return Response({'error': 'indicator_id required'}, status=400)
         
         aggregates = self.get_queryset().filter(indicator_id=indicator_id)
-        return Response(AggregateSerializer(aggregates, many=True).data)
+        return Response(AggregateListSerializer(aggregates, many=True).data)
 
     @action(detail=False, methods=['post'])
     def bulk_create(self, request):

@@ -3,7 +3,10 @@ from .models import Aggregate, AggregateChangeLog, DerivationRule
 
 
 class AggregateChangeLogSerializer(serializers.ModelSerializer):
-    changed_by_name = serializers.CharField(source='changed_by.username', read_only=True)
+    changed_by_name = serializers.SerializerMethodField()
+
+    def get_changed_by_name(self, obj):
+        return getattr(obj.changed_by, 'username', None)
 
     class Meta:
         model = AggregateChangeLog
@@ -11,17 +14,34 @@ class AggregateChangeLogSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
-class AggregateSerializer(serializers.ModelSerializer):
-    """Serializer for Aggregate model."""
-    
-    indicator_name = serializers.CharField(source='indicator.name', read_only=True)
-    indicator_code = serializers.CharField(source='indicator.code', read_only=True)
-    project_name = serializers.CharField(source='project.name', read_only=True)
-    organization_name = serializers.CharField(source='organization.name', read_only=True)
-    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
-    reviewed_by_name = serializers.CharField(source='reviewed_by.username', read_only=True)
-    history_entries = AggregateChangeLogSerializer(many=True, read_only=True)
-    
+class AggregateListSerializer(serializers.ModelSerializer):
+    """Serializer for aggregate list responses."""
+
+    indicator_name = serializers.SerializerMethodField()
+    indicator_code = serializers.SerializerMethodField()
+    project_name = serializers.SerializerMethodField()
+    organization_name = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+    reviewed_by_name = serializers.SerializerMethodField()
+
+    def get_indicator_name(self, obj):
+        return getattr(obj.indicator, 'name', None)
+
+    def get_indicator_code(self, obj):
+        return getattr(obj.indicator, 'code', None)
+
+    def get_project_name(self, obj):
+        return getattr(obj.project, 'name', None)
+
+    def get_organization_name(self, obj):
+        return getattr(obj.organization, 'name', None)
+
+    def get_created_by_name(self, obj):
+        return getattr(obj.created_by, 'username', None)
+
+    def get_reviewed_by_name(self, obj):
+        return getattr(obj.reviewed_by, 'username', None)
+
     class Meta:
         model = Aggregate
         fields = [
@@ -30,12 +50,20 @@ class AggregateSerializer(serializers.ModelSerializer):
             'period_start', 'period_end', 'value', 'notes',
             'status', 'reviewed_at', 'reviewed_by', 'reviewed_by_name',
             'created_at', 'updated_at', 'created_by', 'created_by_name',
-            'history_entries',
         ]
         read_only_fields = [
             'id', 'status', 'reviewed_at', 'reviewed_by',
             'created_at', 'updated_at', 'created_by'
         ]
+
+
+class AggregateSerializer(AggregateListSerializer):
+    """Detailed serializer for single aggregate responses."""
+
+    history_entries = AggregateChangeLogSerializer(many=True, read_only=True)
+
+    class Meta(AggregateListSerializer.Meta):
+        fields = AggregateListSerializer.Meta.fields + ['history_entries']
 
 
 class AggregateReviewSerializer(serializers.Serializer):
