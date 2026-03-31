@@ -1,13 +1,14 @@
-﻿from rest_framework import viewsets, status
+from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
+from django.db import models
 
 from .models import Indicator, Assessment, AssessmentIndicator
 from .serializers import (
-    IndicatorSerializer, IndicatorSimpleSerializer,
+    IndicatorSerializer, IndicatorDetailSerializer, IndicatorSimpleSerializer,
     AssessmentSerializer, AssessmentSimpleSerializer, AssessmentIndicatorSerializer
 )
 
@@ -24,6 +25,11 @@ class IndicatorViewSet(viewsets.ModelViewSet):
     ordering_fields = ['name', 'code', 'category', 'created_at']
     ordering = ['category', 'name']
     
+    def get_serializer_class(self):
+        if self.action == 'retrieve':
+            return IndicatorDetailSerializer
+        return IndicatorSerializer
+
     def get_queryset(self):
         user = self.request.user
         if user.is_superuser or user.is_staff or user.role == 'admin':

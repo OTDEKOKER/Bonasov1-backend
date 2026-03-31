@@ -32,6 +32,7 @@ urlpatterns = [
     path('api/analysis/', include('analysis.urls')),  # dashboard lives here
     path('api/profiles/', include('profiles.urls')),
     path('api/uploads/', include('uploads.urls')),
+    path('api/report-workbooks/', include('uploads.report_workbook_urls')),
     path('api/messages/', include('messaging.urls')),
 ]
 

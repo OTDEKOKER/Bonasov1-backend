@@ -104,3 +104,56 @@ class ScheduledReport(models.Model):
 
     def __str__(self):
         return self.report_name
+
+
+class CoordinatorTarget(models.Model):
+    """Quarterly coordinator portfolio targets per project and indicator."""
+
+    QUARTER_Q1 = 'Q1'
+    QUARTER_Q2 = 'Q2'
+    QUARTER_Q3 = 'Q3'
+    QUARTER_Q4 = 'Q4'
+    QUARTER_CHOICES = [
+        (QUARTER_Q1, 'Q1'),
+        (QUARTER_Q2, 'Q2'),
+        (QUARTER_Q3, 'Q3'),
+        (QUARTER_Q4, 'Q4'),
+    ]
+
+    project = models.ForeignKey(
+        'projects.Project',
+        on_delete=models.CASCADE,
+        related_name='coordinator_targets',
+    )
+    coordinator = models.ForeignKey(
+        'organizations.Organization',
+        on_delete=models.CASCADE,
+        related_name='coordinator_targets',
+    )
+    indicator = models.ForeignKey(
+        'indicators.Indicator',
+        on_delete=models.CASCADE,
+        related_name='coordinator_targets',
+    )
+    year = models.PositiveIntegerField(help_text='Fiscal year start (e.g. 2025 for FY 2025/26).')
+    quarter = models.CharField(max_length=2, choices=QUARTER_CHOICES)
+    target_value = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    notes = models.TextField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-year', 'quarter', 'project__name', 'coordinator__name', 'indicator__name']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['project', 'coordinator', 'indicator', 'year', 'quarter'],
+                name='uq_coordinator_target_scope_period',
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.project.name} - {self.coordinator.name} - "
+            f"{self.indicator.code} ({self.quarter} {self.year})"
+        )

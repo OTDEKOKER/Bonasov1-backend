@@ -1,30 +1,53 @@
 from rest_framework import serializers
+
+from projects.models import ProjectIndicatorOrganizationTarget
+from projects.serializers import ProjectIndicatorOrganizationTargetSerializer
 from .models import Indicator, Assessment, AssessmentIndicator
 
 
 class IndicatorSerializer(serializers.ModelSerializer):
     """Serializer for Indicator model."""
-    
+
     created_by_name = serializers.CharField(source='created_by.username', read_only=True)
     organizations_count = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = Indicator
         fields = [
             'id', 'name', 'code', 'description', 'type', 'category', 'unit',
-            'options', 'sub_labels', 'aggregation_method', 'is_active',
+            'options', 'sub_labels', 'aggregate_disaggregation_config',
+            'aggregation_method', 'is_active',
             'organizations', 'organizations_count', 'created_at', 'updated_at',
             'created_by', 'created_by_name'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'created_by']
-    
+
     def get_organizations_count(self, obj):
         return obj.organizations.count()
 
 
+class IndicatorDetailSerializer(IndicatorSerializer):
+    """Detailed serializer for indicator targets by project and organization."""
+
+    project_targets = serializers.SerializerMethodField()
+
+    class Meta(IndicatorSerializer.Meta):
+        fields = IndicatorSerializer.Meta.fields + ['project_targets']
+
+    def get_project_targets(self, obj):
+        project_targets = ProjectIndicatorOrganizationTarget.objects.filter(
+            project_indicator__indicator=obj
+        ).select_related(
+            'project_indicator__project',
+            'project_indicator__indicator',
+            'organization',
+        )
+        return ProjectIndicatorOrganizationTargetSerializer(project_targets, many=True).data
+
+
 class IndicatorSimpleSerializer(serializers.ModelSerializer):
     """Simple serializer for dropdowns."""
-    
+
     class Meta:
         model = Indicator
         fields = ['id', 'name', 'code', 'type', 'category']
@@ -32,9 +55,9 @@ class IndicatorSimpleSerializer(serializers.ModelSerializer):
 
 class AssessmentIndicatorSerializer(serializers.ModelSerializer):
     """Serializer for AssessmentIndicator through model."""
-    
+
     indicator_detail = IndicatorSimpleSerializer(source='indicator', read_only=True)
-    
+
     class Meta:
         model = AssessmentIndicator
         fields = [
@@ -45,11 +68,11 @@ class AssessmentIndicatorSerializer(serializers.ModelSerializer):
 
 class AssessmentSerializer(serializers.ModelSerializer):
     """Serializer for Assessment model."""
-    
+
     indicators_detail = serializers.SerializerMethodField()
     created_by_name = serializers.CharField(source='created_by.username', read_only=True)
     indicators_count = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = Assessment
         fields = [
@@ -58,18 +81,18 @@ class AssessmentSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at', 'created_by', 'created_by_name'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'created_by']
-    
+
     def get_indicators_detail(self, obj):
         assessment_indicators = AssessmentIndicator.objects.filter(assessment=obj).order_by('order')
         return AssessmentIndicatorSerializer(assessment_indicators, many=True).data
-    
+
     def get_indicators_count(self, obj):
         return obj.indicators.count()
 
 
 class AssessmentSimpleSerializer(serializers.ModelSerializer):
     """Simple serializer for dropdowns."""
-    
+
     class Meta:
         model = Assessment
         fields = ['id', 'name', 'description']

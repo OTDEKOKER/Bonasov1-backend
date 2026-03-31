@@ -1,0 +1,156 @@
+[
+{
+  "model": "token_blacklist.blacklistedtoken",
+  "pk": 1,
+  "fields": {
+    "token": 2,
+    "blacklisted_at": "2026-03-25T10:44:59.796Z"
+  }
+},
+{
+  "model": "token_blacklist.blacklistedtoken",
+  "pk": 2,
+  "fields": {
+    "token": 3,
+    "blacklisted_at": "2026-03-25T11:00:45.891Z"
+  }
+},
+{
+  "model": "users.user",
+  "fields": {
+    "password": "pbkdf2_sha256$600000$C9yw616goCCYDPKSmBOPOv$6Qr6eV3F5Tmp0v8oMU1BZjPIFM20qaZU1yTyeJzDSwo=",
+    "last_login": null,
+    "is_superuser": true,
+    "username": "Lame",
+    "first_name": "",
+    "last_name": "",
+    "is_staff": true,
+    "date_joined": "2026-03-25T08:40:55.046Z",
+    "email": "lamesima@gmail.com",
+    "role": "officer",
+    "organization": null,
+    "phone": "",
+    "avatar": "",
+    "is_active": true,
+    "last_activity": "2026-03-25T10:59:31.980Z",
+    "created_at": "2026-03-25T08:40:55.302Z",
+    "updated_at": "2026-03-25T08:40:55.302Z",
+    "groups": [],
+    "user_permissions": []
+  }
+},
+{
+  "model": "users.useractivity",
+  "pk": 1,
+  "fields": {
+    "user": [
+      "Lame"
+    ],
+    "action": "login",
+    "model_name": "",
+    "object_id": null,
+    "description": "",
+    "ip_address": "192.168.0.102",
+    "timestamp": "2026-03-25T08:45:18.267Z"
+  }
+},
+{
+  "model": "users.useractivity",
+  "pk": 2,
+  "fields": {
+    "user": [
+      "Lame"
+    ],
+    "action": "login",
+    "model_name": "",
+    "object_id": null,
+    "description": "",
+    "ip_address": "192.168.0.102",
+    "timestamp": "2026-03-25T10:44:46.520Z"
+  }
+},
+{
+  "model": "users.useractivity",
+  "pk": 3,
+  "fields": {
+    "user": [
+      "Lame"
+    ],
+    "action": "logout",
+    "model_name": "",
+    "object_id": null,
+    "description": "",
+    "ip_address": "192.168.0.102",
+    "timestamp": "2026-03-25T10:44:59.811Z"
+  }
+},
+{
+  "model": "users.useractivity",
+  "pk": 4,
+  "fields": {
+    "user": [
+      "Lame"
+    ],
+    "action": "login",
+    "model_name": "",
+    "object_id": null,
+    "description": "",
+    "ip_address": "192.168.0.102",
+    "timestamp": "2026-03-25T10:59:31.992Z"
+  }
+},
+{
+  "model": "users.useractivity",
+  "pk": 5,
+  "fields": {
+    "user": [
+      "Lame"
+    ],
+    "action": "logout",
+    "model_name": "",
+    "object_id": null,
+    "description": "",
+    "ip_address": "192.168.0.102",
+    "timestamp": "2026-03-25T11:00:45.908Z"
+  }
+},
+{
+  "model": "token_blacklist.outstandingtoken",
+  "pk": 1,
+  "fields": {
+    "user": [
+      "Lame"
+    ],
+    "jti": "b2675e02656b46509098703f6b3fcf0b",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoicmVmcmVzaCIsImV4cCI6MTc3NTAzMzExNywiaWF0IjoxNzc0NDI4MzE3LCJqdGkiOiJiMjY3NWUwMjY1NmI0NjUwOTA5ODcwM2Y2YjNmY2YwYiIsInVzZXJfaWQiOiIxIn0.AfalBqacr3FA2PX4C7e1nrluzmMScyZCyr7Pe8x5wUo",
+    "created_at": "2026-03-25T08:45:17.850Z",
+    "expires_at": "2026-04-01T08:45:17Z"
+  }
+},
+{
+  "model": "token_blacklist.outstandingtoken",
+  "pk": 2,
+  "fields": {
+    "user": [
+      "Lame"
+    ],
+    "jti": "d207ddd4bcf74b7aabde599ea8f928c0",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoicmVmcmVzaCIsImV4cCI6MTc3NTA0MDI4NiwiaWF0IjoxNzc0NDM1NDg2LCJqdGkiOiJkMjA3ZGRkNGJjZjc0YjdhYWJkZTU5OWVhOGY5MjhjMCIsInVzZXJfaWQiOiIxIn0.VRRCCXT98zwMgqZ0-5t05h_RhsDqNLz2Ged_DpQbAE0",
+    "created_at": "2026-03-25T10:44:46.359Z",
+    "expires_at": "2026-04-01T10:44:46Z"
+  }
+},
+{
+  "model": "token_blacklist.outstandingtoken",
+  "pk": 3,
+  "fields": {
+    "user": [
+      "Lame"
+    ],
+    "jti": "4b4d612bcdf4421fad8461f75e620b91",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoicmVmcmVzaCIsImV4cCI6MTc3NTA0MTE3MSwiaWF0IjoxNzc0NDM2MzcxLCJqdGkiOiI0YjRkNjEyYmNkZjQ0MjFmYWQ4NDYxZjc1ZTYyMGI5MSIsInVzZXJfaWQiOiIxIn0.lHTIrJCrL1DJtsnpC4nC4i3HRU2zgleyCR2U1v5p720",
+    "created_at": "2026-03-25T10:59:31.963Z",
+    "expires_at": "2026-04-01T10:59:31Z"
+  }
+}
+]

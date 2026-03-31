@@ -18,6 +18,11 @@ class Indicator(models.Model):
     CATEGORY_CHOICES = [
         ('hiv_prevention', 'HIV Prevention'),
         ('ncd', 'Non-Communicable Diseases'),
+        ('mental_health', 'Mental Health'),
+        ('gbv', 'GBV'),
+        ('sti', 'STI'),
+        ('trainings', 'Trainings'),
+        ('media', 'Media'),
         ('events', 'Events'),
     ]
     
@@ -33,6 +38,11 @@ class Indicator(models.Model):
     
     # For multi_int type
     sub_labels = models.JSONField(default=list, blank=True, help_text='Labels for multi-int fields')
+    aggregate_disaggregation_config = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Structured matrix configuration for aggregate entry and reporting',
+    )
     
     # Aggregation and calculation
     aggregation_method = models.CharField(

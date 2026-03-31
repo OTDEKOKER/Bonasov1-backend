@@ -18,12 +18,21 @@ class ResponseSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
+class ResponseCreateSerializer(serializers.ModelSerializer):
+    """Minimal serializer for nested Response creation (InteractionCreateSerializer)."""
+
+    class Meta:
+        model = Response
+        fields = ['indicator', 'value']
+
+
 class InteractionSerializer(serializers.ModelSerializer):
     """Serializer for Interaction model."""
     
     respondent_name = serializers.CharField(source='respondent.full_name', read_only=True)
     assessment_name = serializers.CharField(source='assessment.name', read_only=True)
     project_name = serializers.CharField(source='project.name', read_only=True)
+    event_name = serializers.CharField(source='event.title', read_only=True)
     created_by_name = serializers.CharField(source='created_by.username', read_only=True)
     responses = ResponseSerializer(many=True, read_only=True)
     responses_count = serializers.SerializerMethodField()
@@ -32,7 +41,7 @@ class InteractionSerializer(serializers.ModelSerializer):
         model = Interaction
         fields = [
             'id', 'respondent', 'respondent_name', 'assessment', 'assessment_name',
-            'project', 'project_name', 'date', 'notes', 'responses', 'responses_count',
+            'project', 'project_name', 'event', 'event_name', 'date', 'notes', 'responses', 'responses_count',
             'created_at', 'updated_at', 'created_by', 'created_by_name'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'created_by']
@@ -44,11 +53,24 @@ class InteractionSerializer(serializers.ModelSerializer):
 class InteractionCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating interactions with responses."""
     
-    responses = ResponseSerializer(many=True, required=False)
+    responses = ResponseCreateSerializer(many=True, required=False)
     
     class Meta:
         model = Interaction
-        fields = ['respondent', 'assessment', 'project', 'date', 'notes', 'responses']
+        fields = ['respondent', 'assessment', 'project', 'event', 'date', 'notes', 'responses']
+
+    def validate(self, attrs):
+        respondent = attrs.get('respondent') or getattr(self.instance, 'respondent', None)
+        event = attrs.get('event') if 'event' in attrs else getattr(self.instance, 'event', None)
+        if event and respondent:
+            respondent_org_id = respondent.organization_id
+            is_owner_org = event.organization_id == respondent_org_id
+            is_participating_org = event.participating_organizations.filter(id=respondent_org_id).exists()
+            if not (is_owner_org or is_participating_org):
+                raise serializers.ValidationError({
+                    'event': 'Selected event must belong to the respondent organization or include it as a participating organization.'
+                })
+        return attrs
     
     def create(self, validated_data):
         responses_data = validated_data.pop('responses', [])
