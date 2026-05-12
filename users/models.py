@@ -24,6 +24,7 @@ class User(AbstractUser):
     )
     phone = models.CharField(max_length=20, blank=True)
     avatar = models.ImageField(upload_to='avatars/', blank=True, null=True)
+    home_dashboard_preferences = models.JSONField(default=dict, blank=True)
     is_active = models.BooleanField(default=True)
     last_activity = models.DateTimeField(null=True, blank=True)
     

@@ -1,22 +1,14 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import (
-    ReportViewSet,
-    SavedQueryViewSet,
-    ScheduledReportViewSet,
-    CoordinatorTargetViewSet,
-    DashboardView,
-    indicator_trends,
-    indicator_trends_bulk,
-)
+from .views import ReportViewSet, SavedQueryViewSet, ScheduledReportViewSet, DashboardView, CoordinatorTargetViewSet, indicator_trends, indicator_trends_bulk
 
 # Create a router and register our viewsets
 router = DefaultRouter()
 router.register('reports', ReportViewSet, basename='reports')
 router.register('scheduled-reports', ScheduledReportViewSet, basename='scheduled-reports')
 router.register('saved-queries', SavedQueryViewSet, basename='saved-queries')
-router.register('coordinator-targets', CoordinatorTargetViewSet, basename='coordinator-targets')
 router.register('dashboard', DashboardView, basename='dashboard')  # DashboardView as a ViewSet
+router.register('coordinator-targets', CoordinatorTargetViewSet, basename='coordinator-targets')
 
 # Include the router URLs in urlpatterns
 urlpatterns = [

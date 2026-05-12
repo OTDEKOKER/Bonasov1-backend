@@ -1,4 +1,4 @@
-﻿from rest_framework import viewsets, status
+from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -9,7 +9,6 @@ from django.db import models, transaction
 from django.db.models import Count, Sum, Avg
 from django.utils.text import slugify
 from datetime import date
-from decimal import Decimal
 from django.http import HttpResponse
 import csv
 import json
@@ -17,16 +16,10 @@ from io import BytesIO
 
 from .models import Report, SavedQuery, ScheduledReport, CoordinatorTarget
 from indicators.models import Indicator
-from organizations.models import Organization
-from .serializers import (
-    ReportSerializer,
-    SavedQuerySerializer,
-    ScheduledReportSerializer,
-    CoordinatorTargetSerializer,
-    CoordinatorTargetBulkAssignSerializer,
-    DashboardPreferencesSerializer,
-)
+from .serializers import ReportSerializer, SavedQuerySerializer, ScheduledReportSerializer, CoordinatorTargetSerializer
 from aggregates.models import Aggregate
+from organizations.access import get_user_organization_ids, is_organization_admin, filter_queryset_by_org_ids
+from organizations.models import Organization
 
 
 def _month_start(base: date, offset: int) -> date:
@@ -62,61 +55,6 @@ def _extract_total(value) -> float:
     return 0.0
 
 
-def _can_manage_coordinator_targets(user) -> bool:
-    return bool(
-        user
-        and user.is_authenticated
-        and (user.is_superuser or user.is_staff or user.role in ('admin', 'manager'))
-    )
-
-
-def _coordinator_target_status(target_value: float, achievement_percent: float | None) -> str:
-    if target_value <= 0 or achievement_percent is None:
-        return 'no_target'
-    if achievement_percent >= 100:
-        return 'met'
-    if achievement_percent >= 80:
-        return 'on_track'
-    return 'behind'
-
-
-def _fiscal_quarter_date_range(year: int, quarter: str):
-    if quarter == 'Q1':
-        return date(year, 4, 1), date(year, 6, 30)
-    if quarter == 'Q2':
-        return date(year, 7, 1), date(year, 9, 30)
-    if quarter == 'Q3':
-        return date(year, 10, 1), date(year, 12, 31)
-    return date(year + 1, 1, 1), date(year + 1, 3, 31)
-
-
-def _build_organization_descendant_map():
-    descendants_by_parent: dict[int, list[int]] = {}
-    nodes = list(Organization.objects.values_list('id', 'parent_id'))
-    children_by_parent: dict[int, list[int]] = {}
-    for organization_id, parent_id in nodes:
-        children_by_parent.setdefault(parent_id, []).append(organization_id)
-
-    memo: dict[int, list[int]] = {}
-
-    def collect_descendants(organization_id: int) -> list[int]:
-        cached = memo.get(organization_id)
-        if cached is not None:
-            return cached
-
-        descendants: list[int] = []
-        for child_id in children_by_parent.get(organization_id, []):
-            descendants.append(child_id)
-            descendants.extend(collect_descendants(child_id))
-        memo[organization_id] = descendants
-        return descendants
-
-    for organization_id, _ in nodes:
-        descendants_by_parent[organization_id] = collect_descendants(organization_id)
-
-    return descendants_by_parent
-
-
 def _next_run_for_frequency(frequency: str):
     now = timezone.now()
     if frequency == 'daily':
@@ -137,31 +75,85 @@ def _safe_parse_date(value: str):
         return None
 
 
+def _safe_parse_int(value):
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _organization_scope_with_descendants(org_id: int):
+    organization = Organization.objects.filter(id=org_id).first()
+    if not organization:
+        return set()
+    descendants = organization.get_descendants()
+    return {organization.id, *[child.id for child in descendants]}
+
+
+def _restrict_aggregates_to_user_scope(aggregates, user):
+    if is_organization_admin(user):
+        return aggregates
+    org_ids = get_user_organization_ids(user)
+    if org_ids:
+        return filter_queryset_by_org_ids(aggregates, 'organization_id', org_ids)
+    return Aggregate.objects.none()
+
+
+def _approved_aggregates_only(aggregates, request):
+    status_param = request.query_params.get('status')
+    if status_param:
+        statuses = [value.strip() for value in status_param.split(',') if value.strip()]
+        if statuses:
+            return aggregates.filter(status__in=statuses)
+    return aggregates.filter(status='approved')
+
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def indicator_trends(request, indicator_id: int):
     months = int(request.query_params.get('months', 12))
     months = max(1, min(months, 36))
     org_id = request.query_params.get('organization')
+    coordinator_id = request.query_params.get('coordinator')
     project_id = request.query_params.get('project')
     date_from = request.query_params.get('date_from')
     date_to = request.query_params.get('date_to')
 
     user = request.user
-    aggregates = Aggregate.objects.filter(indicator_id=indicator_id)
-    if org_id:
-        aggregates = aggregates.filter(organization_id=org_id)
+    aggregates = Aggregate.objects.filter(indicator_id=indicator_id, status='approved')
+    parsed_org_id = _safe_parse_int(org_id) if org_id not in (None, "") else None
+    parsed_coordinator_id = _safe_parse_int(coordinator_id) if coordinator_id not in (None, "") else None
+    if org_id not in (None, "") and parsed_org_id is None:
+        return Response({'detail': 'organization must be a valid numeric id.'}, status=400)
+    if coordinator_id not in (None, "") and parsed_coordinator_id is None:
+        return Response({'detail': 'coordinator must be a valid numeric id.'}, status=400)
+
+    requested_org_scope = None
+    if parsed_coordinator_id is not None:
+        requested_org_scope = _organization_scope_with_descendants(parsed_coordinator_id)
+    if parsed_org_id is not None:
+        organization_scope = _organization_scope_with_descendants(parsed_org_id)
+        requested_org_scope = (
+            organization_scope
+            if requested_org_scope is None
+            else requested_org_scope.intersection(organization_scope)
+        )
+    if requested_org_scope is not None:
+        if len(requested_org_scope) == 0:
+            return Response({
+                'data': [],
+                'trend': 'stable',
+                'forecast': 0,
+            })
+        aggregates = aggregates.filter(organization_id__in=requested_org_scope)
+
     if project_id:
         aggregates = aggregates.filter(project_id=project_id)
     if date_from:
         aggregates = aggregates.filter(period_start__gte=date_from)
     if date_to:
         aggregates = aggregates.filter(period_end__lte=date_to)
-    if user.role != 'admin':
-        if user.organization:
-            aggregates = aggregates.filter(organization=user.organization)
-        else:
-            aggregates = Aggregate.objects.none()
+    aggregates = _restrict_aggregates_to_user_scope(aggregates, user)
 
     if date_from and date_to:
         start = _safe_parse_date(date_from)
@@ -209,25 +201,42 @@ def indicator_trends_bulk(request):
     months = int(request.query_params.get('months', 12))
     months = max(1, min(months, 36))
     org_id = request.query_params.get('organization')
+    coordinator_id = request.query_params.get('coordinator')
     project_id = request.query_params.get('project')
     date_from = request.query_params.get('date_from')
     date_to = request.query_params.get('date_to')
 
     user = request.user
-    aggregates = Aggregate.objects.filter(indicator_id__in=indicator_ids)
-    if org_id:
-        aggregates = aggregates.filter(organization_id=org_id)
+    aggregates = Aggregate.objects.filter(indicator_id__in=indicator_ids, status='approved')
+    parsed_org_id = _safe_parse_int(org_id) if org_id not in (None, "") else None
+    parsed_coordinator_id = _safe_parse_int(coordinator_id) if coordinator_id not in (None, "") else None
+    if org_id not in (None, "") and parsed_org_id is None:
+        return Response({'detail': 'organization must be a valid numeric id.'}, status=400)
+    if coordinator_id not in (None, "") and parsed_coordinator_id is None:
+        return Response({'detail': 'coordinator must be a valid numeric id.'}, status=400)
+
+    requested_org_scope = None
+    if parsed_coordinator_id is not None:
+        requested_org_scope = _organization_scope_with_descendants(parsed_coordinator_id)
+    if parsed_org_id is not None:
+        organization_scope = _organization_scope_with_descendants(parsed_org_id)
+        requested_org_scope = (
+            organization_scope
+            if requested_org_scope is None
+            else requested_org_scope.intersection(organization_scope)
+        )
+    if requested_org_scope is not None:
+        if len(requested_org_scope) == 0:
+            return Response({'series': []})
+        aggregates = aggregates.filter(organization_id__in=requested_org_scope)
+
     if project_id:
         aggregates = aggregates.filter(project_id=project_id)
     if date_from:
         aggregates = aggregates.filter(period_start__gte=date_from)
     if date_to:
         aggregates = aggregates.filter(period_end__lte=date_to)
-    if user.role != 'admin':
-        if user.organization:
-            aggregates = aggregates.filter(organization=user.organization)
-        else:
-            aggregates = Aggregate.objects.none()
+    aggregates = _restrict_aggregates_to_user_scope(aggregates, user)
 
     if date_from and date_to:
         start = _safe_parse_date(date_from)
@@ -280,6 +289,105 @@ def indicator_trends_bulk(request):
     })
 
 
+
+
+class CoordinatorTargetViewSet(viewsets.ModelViewSet):
+    """Coordinator target CRUD API backed by the live coordinator target table."""
+
+    queryset = CoordinatorTarget.objects.select_related('project', 'coordinator', 'indicator').all()
+    serializer_class = CoordinatorTargetSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [SearchFilter, OrderingFilter]
+    search_fields = ['project__name', 'coordinator__name', 'indicator__name', 'notes']
+    ordering_fields = ['year', 'quarter', 'target_value', 'updated_at', 'created_at']
+    ordering = ['-updated_at']
+
+    def get_queryset(self):
+        qs = self.queryset
+        user = self.request.user
+        if not (user.is_superuser or user.is_staff or getattr(user, 'role', None) == 'admin'):
+            if getattr(user, 'organization', None):
+                qs = qs.filter(
+                    models.Q(coordinator=user.organization) |
+                    models.Q(coordinator__parent=user.organization) |
+                    models.Q(project__organizations=user.organization)
+                ).distinct()
+            else:
+                return qs.none()
+
+        params = self.request.query_params
+        if params.get('project_id'):
+            qs = qs.filter(project_id=params.get('project_id'))
+        if params.get('coordinator_id'):
+            qs = qs.filter(coordinator_id=params.get('coordinator_id'))
+        if params.get('indicator_id'):
+            qs = qs.filter(indicator_id=params.get('indicator_id'))
+        if params.get('year'):
+            qs = qs.filter(year=params.get('year'))
+        if params.get('quarter'):
+            qs = qs.filter(quarter=params.get('quarter'))
+        if params.get('is_active') in {'true', 'false'}:
+            qs = qs.filter(is_active=(params.get('is_active') == 'true'))
+        return qs
+
+    @action(detail=False, methods=['post'], url_path='bulk-assign')
+    def bulk_assign(self, request):
+        project_id = request.data.get('project_id')
+        coordinator_ids = request.data.get('coordinator_ids') or []
+        indicator_ids = request.data.get('indicator_ids') or []
+        year = request.data.get('year')
+        quarter = request.data.get('quarter')
+        target_value = request.data.get('target_value', 0)
+        notes = request.data.get('notes')
+        is_active = request.data.get('is_active', True)
+
+        if not project_id or not coordinator_ids or not indicator_ids or not year or not quarter:
+            return Response({'detail': 'project_id, coordinator_ids, indicator_ids, year, and quarter are required.'}, status=400)
+        if quarter not in {'Q1', 'Q2', 'Q3', 'Q4'}:
+            return Response({'detail': 'quarter must be one of Q1, Q2, Q3, or Q4.'}, status=400)
+
+        created = 0
+        updated = 0
+        skipped = 0
+        with transaction.atomic():
+            for coordinator_id in coordinator_ids:
+                for indicator_id in indicator_ids:
+                    target, target_created = CoordinatorTarget.objects.get_or_create(
+                        project_id=project_id,
+                        coordinator_id=coordinator_id,
+                        indicator_id=indicator_id,
+                        year=year,
+                        quarter=quarter,
+                        defaults={
+                            'target_value': target_value,
+                            'notes': notes,
+                            'is_active': is_active,
+                        },
+                    )
+                    if target_created:
+                        created += 1
+                        continue
+
+                    dirty = []
+                    if str(target.target_value) != str(target_value):
+                        target.target_value = target_value
+                        dirty.append('target_value')
+                    next_notes = notes if notes not in ('', None) else None
+                    if (target.notes if target.notes not in ('', None) else None) != next_notes:
+                        target.notes = next_notes
+                        dirty.append('notes')
+                    if bool(target.is_active) != bool(is_active):
+                        target.is_active = is_active
+                        dirty.append('is_active')
+
+                    if dirty:
+                        target.save(update_fields=dirty + ['updated_at'])
+                        updated += 1
+                    else:
+                        skipped += 1
+
+        return Response({'created': created, 'updated': updated, 'skipped': skipped})
+
 class ReportViewSet(viewsets.ModelViewSet):
     """ViewSet for managing reports."""
     
@@ -293,10 +401,11 @@ class ReportViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or user.is_staff or user.role == 'admin':
+        if is_organization_admin(user):
             return Report.objects.all()
+        org_ids = get_user_organization_ids(user)
         return Report.objects.filter(
-            models.Q(organization=user.organization) |
+            models.Q(organization_id__in=org_ids) |
             models.Q(is_public=True) |
             models.Q(created_by=user)
         )
@@ -328,12 +437,8 @@ class ReportViewSet(viewsets.ModelViewSet):
         if date_to:
             aggregates = aggregates.filter(period_end__lte=date_to)
 
-        user = request.user
-        if user.role != 'admin':
-            if user.organization_id:
-                aggregates = aggregates.filter(organization_id=user.organization_id)
-            else:
-                aggregates = Aggregate.objects.none()
+        aggregates = _restrict_aggregates_to_user_scope(aggregates, request.user)
+        aggregates = _approved_aggregates_only(aggregates, request)
 
         cached_rows = []
         if report.report_type == 'indicator':
@@ -480,7 +585,7 @@ class ScheduledReportViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or user.is_staff or user.role == 'admin':
+        if is_organization_admin(user):
             return ScheduledReport.objects.all()
         return ScheduledReport.objects.filter(created_by=user)
 
@@ -490,330 +595,161 @@ class ScheduledReportViewSet(viewsets.ModelViewSet):
         serializer.save(created_by=self.request.user, next_run=next_run)
 
 
-class CoordinatorTargetViewSet(viewsets.ModelViewSet):
-    """CRUD and analytics endpoints for coordinator portfolio targets."""
-
-    queryset = CoordinatorTarget.objects.select_related('project', 'coordinator', 'indicator')
-    serializer_class = CoordinatorTargetSerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [SearchFilter, OrderingFilter]
-    search_fields = [
-        'project__name',
-        'project__code',
-        'coordinator__name',
-        'indicator__name',
-        'indicator__code',
-        'notes',
-    ]
-    ordering_fields = ['year', 'quarter', 'target_value', 'created_at', 'updated_at']
-    ordering = ['-year', 'quarter', 'project__name', 'coordinator__name', 'indicator__name']
-
-    def get_queryset(self):
-        queryset = CoordinatorTarget.objects.select_related('project', 'coordinator', 'indicator').all()
-        user = self.request.user
-
-        # Scope non-admin users to their organization branch while keeping read-only access.
-        if not (user.is_superuser or user.is_staff or user.role == 'admin'):
-            if user.organization:
-                organization = user.organization
-                descendants = organization.get_descendants()
-                ancestors = organization.get_ancestors()
-                scoped_ids = (
-                    [organization.id]
-                    + [entry.id for entry in descendants]
-                    + [entry.id for entry in ancestors]
-                )
-                queryset = queryset.filter(
-                    models.Q(coordinator_id__in=scoped_ids)
-                    | models.Q(project__organizations__id__in=scoped_ids)
-                ).distinct()
-            else:
-                queryset = CoordinatorTarget.objects.none()
-
-        params = self.request.query_params
-        project_id = params.get('project_id') or params.get('project')
-        coordinator_id = params.get('coordinator_id') or params.get('coordinator')
-        indicator_id = params.get('indicator_id') or params.get('indicator')
-        year = params.get('year')
-        quarter = params.get('quarter')
-        is_active = params.get('is_active')
-
-        if project_id:
-            queryset = queryset.filter(project_id=project_id)
-        if coordinator_id:
-            queryset = queryset.filter(coordinator_id=coordinator_id)
-        if indicator_id:
-            queryset = queryset.filter(indicator_id=indicator_id)
-        if year:
-            queryset = queryset.filter(year=year)
-        if quarter:
-            queryset = queryset.filter(quarter=quarter)
-        if is_active in ('true', 'false'):
-            queryset = queryset.filter(is_active=(is_active == 'true'))
-
-        return queryset
-
-    def create(self, request, *args, **kwargs):
-        if not _can_manage_coordinator_targets(request.user):
-            return Response({'detail': 'You do not have permission to edit coordinator targets.'}, status=403)
-        return super().create(request, *args, **kwargs)
-
-    def update(self, request, *args, **kwargs):
-        if not _can_manage_coordinator_targets(request.user):
-            return Response({'detail': 'You do not have permission to edit coordinator targets.'}, status=403)
-        return super().update(request, *args, **kwargs)
-
-    def partial_update(self, request, *args, **kwargs):
-        if not _can_manage_coordinator_targets(request.user):
-            return Response({'detail': 'You do not have permission to edit coordinator targets.'}, status=403)
-        return super().partial_update(request, *args, **kwargs)
-
-    def destroy(self, request, *args, **kwargs):
-        if not _can_manage_coordinator_targets(request.user):
-            return Response({'detail': 'You do not have permission to edit coordinator targets.'}, status=403)
-        return super().destroy(request, *args, **kwargs)
-
-    @action(detail=False, methods=['post'], url_path='bulk-assign')
-    def bulk_assign(self, request):
-        if not _can_manage_coordinator_targets(request.user):
-            return Response({'detail': 'You do not have permission to edit coordinator targets.'}, status=403)
-
-        serializer = CoordinatorTargetBulkAssignSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        payload = serializer.validated_data
-
-        project = payload['project']
-        coordinators = payload['coordinator_ids']
-        indicators = payload['indicator_ids']
-        year = payload['year']
-        quarter = payload['quarter']
-        target_value = payload['target_value']
-        notes = payload.get('notes') or None
-        is_active = payload.get('is_active', True)
-
-        created = 0
-        updated = 0
-        skipped = 0
-
-        with transaction.atomic():
-            for coordinator in coordinators:
-                for indicator in indicators:
-                    target, was_created = CoordinatorTarget.objects.get_or_create(
-                        project=project,
-                        coordinator=coordinator,
-                        indicator=indicator,
-                        year=year,
-                        quarter=quarter,
-                        defaults={
-                            'target_value': target_value,
-                            'notes': notes,
-                            'is_active': is_active,
-                        },
-                    )
-                    if was_created:
-                        created += 1
-                        continue
-
-                    changed = False
-                    if target.target_value != target_value:
-                        target.target_value = target_value
-                        changed = True
-                    if (target.notes or None) != notes:
-                        target.notes = notes
-                        changed = True
-                    if target.is_active != is_active:
-                        target.is_active = is_active
-                        changed = True
-
-                    if changed:
-                        target.save(update_fields=['target_value', 'notes', 'is_active', 'updated_at'])
-                        updated += 1
-                    else:
-                        skipped += 1
-
-        return Response({'created': created, 'updated': updated, 'skipped': skipped})
-
-    @action(detail=False, methods=['get'], url_path='performance')
-    def performance(self, request):
-        targets = list(self.filter_queryset(self.get_queryset()).select_related('project', 'coordinator', 'indicator'))
-        if not targets:
-            return Response([])
-
-        descendants_by_parent = _build_organization_descendant_map()
-        org_name_by_id = dict(Organization.objects.values_list('id', 'name'))
-
-        performance_rows = []
-        for target in targets:
-            period_start, period_end = _fiscal_quarter_date_range(target.year, target.quarter)
-            descendant_ids = descendants_by_parent.get(target.coordinator_id, [])
-            scoped_org_ids = [target.coordinator_id, *descendant_ids]
-
-            aggregate_qs = Aggregate.objects.filter(
-                project_id=target.project_id,
-                indicator_id=target.indicator_id,
-                organization_id__in=scoped_org_ids,
-                period_start__lte=period_end,
-                period_end__gte=period_start,
-            )
-
-            seen_aggregate_ids = set()
-            actual_total = Decimal('0')
-            child_totals: dict[int, Decimal] = {}
-
-            for aggregate in aggregate_qs:
-                if aggregate.id in seen_aggregate_ids:
-                    continue
-                seen_aggregate_ids.add(aggregate.id)
-
-                numeric_value = Decimal(str(_extract_total(aggregate.value)))
-                actual_total += numeric_value
-                if aggregate.organization_id != target.coordinator_id:
-                    child_totals[aggregate.organization_id] = (
-                        child_totals.get(aggregate.organization_id, Decimal('0')) + numeric_value
-                    )
-
-            target_value = Decimal(str(target.target_value or 0))
-            target_value_float = float(target_value)
-            actual_value_float = float(actual_total)
-            achievement_percent = (
-                (actual_value_float / target_value_float) * 100
-                if target_value_float > 0
-                else None
-            )
-            variance = actual_value_float - target_value_float
-
-            child_contributions = []
-            for organization_id, child_value in sorted(child_totals.items(), key=lambda item: item[1], reverse=True):
-                child_value_float = float(child_value)
-                child_contributions.append({
-                    'organization_id': organization_id,
-                    'organization_name': org_name_by_id.get(organization_id, f'Organization {organization_id}'),
-                    'actual_value': child_value_float,
-                    'share_percent': (child_value_float / actual_value_float * 100) if actual_value_float > 0 else 0.0,
-                })
-
-            performance_rows.append({
-                'target_id': target.id,
-                'project_id': target.project_id,
-                'coordinator_id': target.coordinator_id,
-                'indicator_id': target.indicator_id,
-                'year': target.year,
-                'quarter': target.quarter,
-                'target_value': target_value_float,
-                'actual_value': actual_value_float,
-                'achievement_percent': achievement_percent,
-                'variance': variance,
-                'status': _coordinator_target_status(target_value_float, achievement_percent),
-                'child_contributions': child_contributions,
-            })
-
-        return Response(performance_rows)
-
-
 class DashboardView(viewsets.ViewSet):
     """Dashboard analytics endpoints."""
     
     permission_classes = [IsAuthenticated]
-
-    def _get_preference_report(self, user):
-        report = (
-            Report.objects.filter(
-                report_type='dashboard',
-                created_by=user,
-                is_public=False,
-            )
-            .order_by('id')
-            .first()
-        )
-        if report is None:
-            report = Report.objects.create(
-                name='My Dashboard Preferences',
-                description='Per-user dashboard card selections and layout.',
-                report_type='dashboard',
-                organization=user.organization,
-                is_public=False,
-                created_by=user,
-                parameters={
-                    'preferences': {
-                        'selected_indicator_ids': [],
-                        'card_order': [],
-                        'hidden_sections': [],
-                        'layout': {},
-                    }
-                },
-            )
-        return report
     
     @action(detail=False, methods=['get'])
     def overview(self, request):
         """Get dashboard overview stats."""
         from respondents.models import Respondent, Interaction
         from projects.models import Project
-        from indicators.models import Indicator
-        
+
         user = request.user
-        
+        project_param = request.query_params.get('project')
+        coordinator_param = request.query_params.get('coordinator')
+        organization_param = request.query_params.get('organization')
+        date_from_param = request.query_params.get('date_from')
+        date_to_param = request.query_params.get('date_to')
+
+        project_id = _safe_parse_int(project_param) if project_param not in (None, "") else None
+        coordinator_id = _safe_parse_int(coordinator_param) if coordinator_param not in (None, "") else None
+        organization_id = _safe_parse_int(organization_param) if organization_param not in (None, "") else None
+
+        if project_param not in (None, "") and project_id is None:
+            return Response(
+                {'detail': 'project must be a valid numeric id.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if coordinator_param not in (None, "") and coordinator_id is None:
+            return Response(
+                {'detail': 'coordinator must be a valid numeric id.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if organization_param not in (None, "") and organization_id is None:
+            return Response(
+                {'detail': 'organization must be a valid numeric id.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        date_from = _safe_parse_date(date_from_param) if date_from_param else None
+        date_to = _safe_parse_date(date_to_param) if date_to_param else None
+        if date_from_param and not date_from:
+            return Response(
+                {'detail': 'Invalid date_from. Expected YYYY-MM-DD.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if date_to_param and not date_to:
+            return Response(
+                {'detail': 'Invalid date_to. Expected YYYY-MM-DD.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if date_from and date_to and date_from > date_to:
+            return Response(
+                {'detail': 'date_from must be before date_to.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        def _org_scope_with_descendants(org_id: int) -> set[int]:
+            organization = Organization.objects.filter(id=org_id).first()
+            if not organization:
+                return set()
+            descendants = organization.get_descendants()
+            return {organization.id, *[child.id for child in descendants]}
+
+        requested_org_ids = None
+        if coordinator_id is not None:
+            requested_org_ids = _org_scope_with_descendants(coordinator_id)
+        if organization_id is not None:
+            organization_scope = _org_scope_with_descendants(organization_id)
+            requested_org_ids = (
+                organization_scope
+                if requested_org_ids is None
+                else requested_org_ids.intersection(organization_scope)
+            )
+
+        if requested_org_ids is not None and len(requested_org_ids) == 0:
+            return Response(
+                {
+                    'total_respondents': 0,
+                    'total_assessments': 0,
+                    'active_projects': 0,
+                    'total_indicators': 0,
+                    'indicators_behind': 0,
+                    'recent_activity': [],
+                }
+            )
+
+        user_scope_ids = None if is_organization_admin(user) else set(get_user_organization_ids(user) or [])
+        effective_org_ids = requested_org_ids
+        if user_scope_ids is not None:
+            effective_org_ids = (
+                user_scope_ids
+                if effective_org_ids is None
+                else effective_org_ids.intersection(user_scope_ids)
+            )
+            if len(effective_org_ids) == 0:
+                return Response(
+                    {
+                        'total_respondents': 0,
+                        'total_assessments': 0,
+                        'active_projects': 0,
+                        'total_indicators': 0,
+                        'indicators_behind': 0,
+                        'recent_activity': [],
+                    }
+                )
+
         # Build base querysets based on user role
-        if user.is_superuser or user.is_staff or user.role == 'admin':
-            respondents = Respondent.objects.all()
-            interactions = Interaction.objects.all()
-            projects = Project.objects.all()
-        elif user.organization:
-            respondents = Respondent.objects.filter(organization=user.organization)
-            interactions = Interaction.objects.filter(respondent__organization=user.organization)
-            projects = Project.objects.filter(organizations=user.organization)
-        else:
-            respondents = Respondent.objects.none()
-            interactions = Interaction.objects.none()
-            projects = Project.objects.none()
+        respondents = Respondent.objects.all()
+        interactions = Interaction.objects.all()
+        projects = Project.objects.all()
+
+        if effective_org_ids is not None:
+            respondents = respondents.filter(organization_id__in=effective_org_ids)
+            interactions = interactions.filter(respondent__organization_id__in=effective_org_ids)
+            projects = projects.filter(organizations__id__in=effective_org_ids).distinct()
+
+        if project_id is not None:
+            projects = projects.filter(id=project_id)
+            interactions = interactions.filter(project_id=project_id)
+
+        if date_from:
+            interactions = interactions.filter(date__gte=date_from)
+        if date_to:
+            interactions = interactions.filter(date__lte=date_to)
+
+        if project_id is not None or date_from or date_to:
+            respondent_ids = interactions.values_list('respondent_id', flat=True).distinct()
+            respondents = respondents.filter(id__in=respondent_ids)
+
+        indicators = Indicator.objects.filter(is_active=True)
+        if project_id is not None:
+            indicators = indicators.filter(projects__id=project_id)
+        if effective_org_ids is not None:
+            indicators = indicators.filter(organizations__id__in=effective_org_ids)
+        total_indicators = indicators.distinct().count()
+
+        recent_activity = []
+        for interaction in interactions.select_related('respondent').order_by('-date', '-created_at')[:10]:
+            respondent_name = (
+                interaction.respondent.full_name
+                if getattr(interaction, 'respondent_id', None)
+                else 'Respondent'
+            )
+            recent_activity.append({
+                'type': 'interaction',
+                'description': f'Interaction recorded for {respondent_name}',
+                'timestamp': interaction.created_at.isoformat(),
+            })
         
         return Response({
             'total_respondents': respondents.count(),
             'total_assessments': interactions.count(),
             'active_projects': projects.filter(status='active').count(),
-            'total_indicators': Indicator.objects.filter(is_active=True).count(),
+            'total_indicators': total_indicators,
             'indicators_behind': 0,  # Calculate based on project targets
-            'recent_activity': [],
+            'recent_activity': recent_activity,
         })
-
-    @action(detail=False, methods=['get', 'put'], url_path='preferences')
-    def preferences(self, request):
-        """Read or update dashboard card preferences for the current user."""
-        report = self._get_preference_report(request.user)
-        stored_preferences = (report.parameters or {}).get('preferences') or {}
-
-        if request.method == 'GET':
-            serializer = DashboardPreferencesSerializer(
-                stored_preferences,
-                context={'request': request},
-            )
-            return Response(
-                {
-                    'report_id': report.id,
-                    'preferences': serializer.data,
-                    'available_indicators': serializer.get_available_indicators(),
-                }
-            )
-
-        serializer = DashboardPreferencesSerializer(
-            data=request.data,
-            context={'request': request},
-        )
-        serializer.is_valid(raise_exception=True)
-
-        report.parameters = {
-            **(report.parameters or {}),
-            'preferences': serializer.validated_data,
-        }
-        if not report.organization_id and request.user.organization_id:
-            report.organization = request.user.organization
-        report.save(update_fields=['parameters', 'organization', 'updated_at'])
-
-        return Response(
-            {
-                'report_id': report.id,
-                'preferences': serializer.data,
-                'available_indicators': serializer.get_available_indicators(),
-            }
-        )
 

@@ -4,14 +4,13 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response as DRFResponse
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.exceptions import PermissionDenied
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
-from django.db.models import Count
+from django.db.models import Count, Max, Prefetch
 from django.http import HttpResponse
 import csv
+from organizations.access import get_user_organization_ids, is_organization_admin, filter_queryset_by_org_ids
 
-from core.permissions import is_platform_admin
 from .models import Respondent, Interaction, Response
 from .serializers import (
     RespondentSerializer,
@@ -36,34 +35,40 @@ class RespondentViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         """Filter queryset by user role and organization."""
+        queryset = Respondent.objects.select_related(
+            'organization', 'created_by'
+        ).annotate(
+            interactions_count=Count('interactions', distinct=True),
+            last_interaction_date=Max('interactions__date'),
+        )
+
+        if self.action in {'retrieve', 'profile'}:
+            queryset = queryset.prefetch_related(
+                Prefetch(
+                    'interactions',
+                    queryset=Interaction.objects.select_related(
+                        'respondent', 'assessment', 'project', 'created_by'
+                    ).annotate(
+                        responses_count=Count('responses', distinct=True)
+                    ).prefetch_related(
+                        Prefetch(
+                            'responses',
+                            queryset=Response.objects.select_related('indicator'),
+                        )
+                    ),
+                )
+            )
+
         user = self.request.user
-        if is_platform_admin(user):
-            return Respondent.objects.all()
-        elif user.organization:
-            return Respondent.objects.filter(organization=user.organization)
+        if is_organization_admin(user):
+            return queryset
+        org_ids = get_user_organization_ids(user)
+        if org_ids:
+            return filter_queryset_by_org_ids(queryset, 'organization_id', org_ids)
         return Respondent.objects.none()
     
     def perform_create(self, serializer):
-        user = self.request.user
-        organization = serializer.validated_data.get('organization')
-        if not is_platform_admin(user):
-            if not user.organization_id:
-                raise PermissionDenied('You must belong to an organization to create respondents.')
-            if organization and organization.id != user.organization_id:
-                raise PermissionDenied('You can only create respondents in your organization.')
-            serializer.save(created_by=user, organization=user.organization)
-            return
-        serializer.save(created_by=user)
-
-    def perform_update(self, serializer):
-        user = self.request.user
-        organization = serializer.validated_data.get('organization', serializer.instance.organization)
-        if not is_platform_admin(user):
-            if not user.organization_id or organization.id != user.organization_id:
-                raise PermissionDenied('You can only update respondents in your organization.')
-            serializer.save(organization=user.organization)
-            return
-        serializer.save()
+        serializer.save(created_by=self.request.user)
     
     @action(detail=True, methods=['get'])
     def profile(self, request, pk=None):
@@ -114,24 +119,36 @@ class InteractionViewSet(viewsets.ModelViewSet):
     queryset = Interaction.objects.all()
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ['respondent', 'assessment', 'project', 'event']
+    filterset_fields = ['respondent', 'assessment', 'project']
     search_fields = ['respondent__unique_id', 'notes']
     ordering_fields = ['date', 'created_at']
     ordering = ['-date', '-created_at']
     
     def get_serializer_class(self):
-        if self.action in ['create', 'update', 'partial_update']:
+        if self.action == 'create':
             return InteractionCreateSerializer
         return InteractionSerializer
     
     def get_queryset(self):
         """Filter interactions by user role and organization."""
+        queryset = Interaction.objects.select_related(
+            'respondent', 'assessment', 'project', 'created_by'
+        ).annotate(
+            responses_count=Count('responses', distinct=True)
+        ).prefetch_related(
+            Prefetch(
+                'responses',
+                queryset=Response.objects.select_related('indicator'),
+            )
+        )
+
         user = self.request.user
-        if is_platform_admin(user):
-            return Interaction.objects.all()
-        elif user.organization:
-            return Interaction.objects.filter(respondent__organization=user.organization)
-        return Interaction.objects.filter(created_by=user)
+        if is_organization_admin(user):
+            return queryset
+        org_ids = get_user_organization_ids(user)
+        if org_ids:
+            return filter_queryset_by_org_ids(queryset, 'respondent__organization_id', org_ids)
+        return queryset.filter(created_by=user)
     
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
@@ -152,7 +169,7 @@ class InteractionViewSet(viewsets.ModelViewSet):
 class ResponseViewSet(viewsets.ModelViewSet):
     """ViewSet for managing responses."""
     
-    queryset = Response.objects.all()
+    queryset = Response.objects.select_related('interaction', 'indicator')
     serializer_class = ResponseSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
@@ -160,19 +177,13 @@ class ResponseViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if is_platform_admin(user):
-            return Response.objects.all()
-        if user.organization_id:
-            return Response.objects.filter(interaction__respondent__organization_id=user.organization_id)
-        return Response.objects.filter(interaction__created_by=user)
-
-    def perform_create(self, serializer):
-        user = self.request.user
-        interaction = serializer.validated_data['interaction']
-        if not is_platform_admin(user):
-            if user.organization_id and interaction.respondent.organization_id != user.organization_id:
-                raise PermissionDenied('You can only add responses for your organization.')
-            if not user.organization_id and interaction.created_by_id != user.id:
-                raise PermissionDenied('You can only add responses to your own interactions.')
-        serializer.save()
+        queryset = Response.objects.select_related(
+            'interaction', 'indicator', 'interaction__respondent'
+        )
+        if is_organization_admin(user):
+            return queryset
+        org_ids = get_user_organization_ids(user)
+        if org_ids:
+            return filter_queryset_by_org_ids(queryset, 'interaction__respondent__organization_id', org_ids)
+        return queryset.filter(interaction__created_by=user)
 

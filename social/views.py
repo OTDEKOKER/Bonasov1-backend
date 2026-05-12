@@ -2,6 +2,7 @@
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
+from organizations.access import get_user_organization_ids, is_organization_admin, filter_queryset_by_org_ids
 
 from .models import SocialPost
 from .serializers import SocialPostSerializer
@@ -21,10 +22,11 @@ class SocialPostViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or user.is_staff or user.role == 'admin':
+        if is_organization_admin(user):
             return SocialPost.objects.all()
-        elif user.organization:
-            return SocialPost.objects.filter(organization=user.organization)
+        org_ids = get_user_organization_ids(user)
+        if org_ids:
+            return filter_queryset_by_org_ids(SocialPost.objects.all(), 'organization_id', org_ids)
         return SocialPost.objects.none()
 
     def perform_create(self, serializer):

@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
+import django_filters
 from rest_framework.filters import OrderingFilter
 from django.db import transaction
 from django.db.models import Sum
@@ -12,439 +13,241 @@ import csv
 import json
 from io import BytesIO
 
-from .models import Aggregate, AggregateChangeLog, DerivationRule
-from .serializers import (
-    AggregateFlagSerializer,
-    AggregateListSerializer,
-    AggregateSerializer,
-    AggregateReviewSerializer,
-    DerivationRuleSerializer,
-    GenerateFromInteractionsSerializer,
-)
-from core.permissions import is_platform_admin
-from flags.models import Flag, FlagComment
+from .models import Aggregate
+from .pagination import AggregatePagination
+from .serializers import AggregateSerializer
 from indicators.models import Indicator
-from messaging.models import Notification
+from flags.models import Flag
 from projects.models import Project
 from respondents.models import Response as InteractionResponse
+from organizations.access import get_user_organization_ids, is_organization_admin, filter_queryset_by_org_ids
+from organizations.models import Organization
+from respondents.rollups import sync_project_indicator_total
+from users.models import User
+from messaging.notifications import (
+    AggregateNotificationContext,
+    notify_aggregate_status_to_submitter,
+    notify_aggregate_submitted_for_review,
+)
+
+
+class AggregateFilterSet(django_filters.FilterSet):
+    """Allow comma-separated status filters from the review queue UI."""
+
+    status = django_filters.CharFilter(method="filter_status")
+    organization = django_filters.CharFilter(method="filter_organization")
+    coordinator = django_filters.CharFilter(method="filter_coordinator")
+    include_org_descendants = django_filters.CharFilter(method="filter_include_org_descendants")
+    date_from = django_filters.DateFilter(field_name="period_start", lookup_expr="gte")
+    date_to = django_filters.DateFilter(field_name="period_end", lookup_expr="lte")
+
+    class Meta:
+        model = Aggregate
+        fields = {
+            "indicator": ["exact"],
+            "project": ["exact"],
+            "period_start": ["exact"],
+            "period_end": ["exact"],
+        }
+
+    def _to_int(self, value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _org_scope_with_descendants(self, org_id: int):
+        organization = Organization.objects.filter(id=org_id).first()
+        if not organization:
+            return []
+        descendants = organization.get_descendants()
+        return [organization.id] + [child.id for child in descendants]
+
+    def _is_truthy(self, value):
+        return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def filter_status(self, queryset, name, value):
+        statuses = [item.strip() for item in str(value).split(",") if item.strip()]
+        if not statuses:
+            return queryset
+        return queryset.filter(status__in=statuses)
+
+    def filter_organization(self, queryset, name, value):
+        org_id = self._to_int(value)
+        if org_id is None:
+            return queryset.none()
+        include_descendants = self._is_truthy(self.data.get("include_org_descendants"))
+        if include_descendants:
+            scoped_org_ids = self._org_scope_with_descendants(org_id)
+            if not scoped_org_ids:
+                return queryset.none()
+            return queryset.filter(organization_id__in=scoped_org_ids)
+        return queryset.filter(organization_id=org_id)
+
+    def filter_coordinator(self, queryset, name, value):
+        coordinator_id = self._to_int(value)
+        if coordinator_id is None:
+            return queryset.none()
+        scoped_org_ids = self._org_scope_with_descendants(coordinator_id)
+        if not scoped_org_ids:
+            return queryset.none()
+        return queryset.filter(organization_id__in=scoped_org_ids)
+
+    def filter_include_org_descendants(self, queryset, name, value):
+        return queryset
 
 
 class AggregateViewSet(viewsets.ModelViewSet):
     """ViewSet for managing aggregate data."""
     
     queryset = Aggregate.objects.all()
-    serializer_class = AggregateListSerializer
+    serializer_class = AggregateSerializer
+    pagination_class = AggregatePagination
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, OrderingFilter]
-    filterset_fields = ['indicator', 'project', 'organization', 'period_start', 'period_end', 'status', 'reviewed_by']
-    ordering_fields = ['period_start', 'period_end', 'created_at', 'reviewed_at']
+    filterset_class = AggregateFilterSet
+    ordering_fields = ['period_start', 'period_end', 'created_at']
     ordering = ['-period_start']
 
-    FLAG_REASON_LABELS = {
-        'duplicate': 'Duplicate entry',
-        'incorrect_data': 'Incorrect data',
-        'suspicious': 'Suspicious values',
-        'incomplete': 'Incomplete information',
-        'other': 'Other issue',
-    }
-
-    FLAG_PRIORITY_MAP = {
-        'low': 'low',
-        'medium': 'medium',
-        'high': 'high',
-    }
-
-    TRACKED_FIELD_LABELS = {
-        'indicator': 'Indicator',
-        'project': 'Project',
-        'organization': 'Organization',
-        'period_start': 'Period start',
-        'period_end': 'Period end',
-        'notes': 'Notes',
-        'value': 'Captured values',
-        'status': 'Status',
-    }
-
-    def _json_safe(self, value):
-        if isinstance(value, dict):
-            return {str(key): self._json_safe(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [self._json_safe(item) for item in value]
-        if hasattr(value, 'isoformat'):
-            return value.isoformat()
-        return value
-
-    def _snapshot_aggregate(self, aggregate):
-        return {
-            'indicator': aggregate.indicator_id,
-            'project': aggregate.project_id,
-            'organization': aggregate.organization_id,
-            'period_start': aggregate.period_start,
-            'period_end': aggregate.period_end,
-            'notes': aggregate.notes or '',
-            'value': self._json_safe(aggregate.value),
-            'status': aggregate.status,
-        }
-
-    def _build_change_set(self, before, after):
-        changes = {}
-        for field_name, label in self.TRACKED_FIELD_LABELS.items():
-            before_value = self._json_safe(before.get(field_name))
-            after_value = self._json_safe(after.get(field_name))
-            if before_value != after_value:
-                changes[field_name] = {
-                    'label': label,
-                    'from': before_value,
-                    'to': after_value,
-                }
-        return changes
-
-    def _record_history(self, aggregate, action, user=None, comment='', changes=None):
-        AggregateChangeLog.objects.create(
-            aggregate=aggregate,
-            action=action,
-            changed_by=user if getattr(user, 'is_authenticated', False) else None,
-            comment=(comment or '').strip(),
-            changes=changes or {},
+    def _notification_context(self, aggregate: Aggregate) -> AggregateNotificationContext:
+        indicator_label = (
+            (getattr(aggregate.indicator, 'code', None) or '').strip()
+            or (getattr(aggregate.indicator, 'name', None) or '').strip()
+            or f"Indicator {aggregate.indicator_id}"
+        )
+        organization_name = (
+            (getattr(aggregate.organization, 'name', None) or '').strip()
+            or f"Organization {aggregate.organization_id}"
+        )
+        return AggregateNotificationContext(
+            aggregate_id=int(aggregate.id),
+            organization_id=int(aggregate.organization_id),
+            indicator_label=indicator_label,
+            organization_name=organization_name,
+            period_start=aggregate.period_start.isoformat() if aggregate.period_start else '',
+            period_end=aggregate.period_end.isoformat() if aggregate.period_end else '',
         )
 
-    def _notify_user(self, user, title, content, link=''):
-        if not user:
-            return
-        Notification.objects.create(
-            user=user,
-            title=title,
-            content=content,
-            link=link or '',
+    def _notify_pending_submission(self, aggregate: Aggregate) -> None:
+        notify_aggregate_submitted_for_review(
+            context=self._notification_context(aggregate),
+            actor=self.request.user,
         )
 
-    def _get_active_flag(self, aggregate):
-        return (
-            Flag.objects.filter(content_type='aggregate', object_id=aggregate.id)
-            .exclude(status__in=['resolved', 'dismissed'])
-            .order_by('-created_at', '-id')
-            .first()
+    def _notify_status_change(self, aggregate: Aggregate, status_value: str) -> None:
+        notify_aggregate_status_to_submitter(
+            context=self._notification_context(aggregate),
+            actor=self.request.user,
+            submitter=aggregate.created_by,
+            status_value=status_value,
         )
-
-    def _set_active_flag_status(self, aggregate, status_value, resolution_notes=''):
-        active_flag = self._get_active_flag(aggregate)
-        if not active_flag:
-            return None
-        active_flag.status = status_value
-        if status_value == 'resolved':
-            active_flag.resolution_notes = resolution_notes or active_flag.resolution_notes
-            active_flag.resolved_at = timezone.now()
-            active_flag.resolved_by = self.request.user
-            active_flag.save(
-                update_fields=['status', 'resolution_notes', 'resolved_at', 'resolved_by', 'updated_at']
-            )
-        else:
-            active_flag.resolution_notes = resolution_notes or active_flag.resolution_notes
-            active_flag.resolved_at = None
-            active_flag.resolved_by = None
-            active_flag.save(
-                update_fields=['status', 'resolution_notes', 'resolved_at', 'resolved_by', 'updated_at']
-            )
-        return active_flag
-
-    def _ensure_flag_for_correction(self, aggregate, user, reason_label, description, severity):
-        flag_title = f"Aggregate requires correction: {aggregate.indicator.code}"
-        base_comment = f"Reason: {reason_label}."
-        if description:
-            base_comment = f"{base_comment} {description}"
-
-        active_flag = self._get_active_flag(aggregate)
-        if active_flag:
-            active_flag.status = 'open'
-            active_flag.priority = self.FLAG_PRIORITY_MAP.get(severity, 'medium')
-            active_flag.title = flag_title
-            active_flag.description = (
-                f"Aggregate {aggregate.indicator.code} for {aggregate.organization.name} "
-                f"({aggregate.period_start} to {aggregate.period_end}) requires correction."
-            )
-            active_flag.resolution_notes = ''
-            active_flag.resolved_at = None
-            active_flag.resolved_by = None
-            active_flag.assigned_to = aggregate.created_by
-            active_flag.save(
-                update_fields=[
-                    'status',
-                    'priority',
-                    'title',
-                    'description',
-                    'resolution_notes',
-                    'resolved_at',
-                    'resolved_by',
-                    'assigned_to',
-                    'updated_at',
-                ]
-            )
-            FlagComment.objects.create(flag=active_flag, content=base_comment, created_by=user)
-            return active_flag
-
-        created_flag = Flag.objects.create(
-            flag_type='data_quality',
-            priority=self.FLAG_PRIORITY_MAP.get(severity, 'medium'),
-            title=flag_title,
-            description=(
-                f"Aggregate {aggregate.indicator.code} for {aggregate.organization.name} "
-                f"({aggregate.period_start} to {aggregate.period_end}) requires correction."
-            ),
-            content_type='aggregate',
-            object_id=aggregate.id,
-            organization_id=aggregate.organization_id,
-            assigned_to=aggregate.created_by,
-            created_by=user,
-        )
-        FlagComment.objects.create(flag=created_flag, content=base_comment, created_by=user)
-        return created_flag
-
-    def _get_manager_scope_ids(self, user):
-        if not getattr(user, 'organization_id', None):
-            return []
-        organization = user.organization
-        descendants = organization.get_descendants() if organization else []
-        return [organization.id, *[item.id for item in descendants if item.id != organization.id]]
-
-    def _can_write_organization(self, user, organization_id):
-        if is_platform_admin(user):
-            return True
-        return bool(getattr(user, 'organization_id', None) and int(user.organization_id) == int(organization_id))
-
-    def _can_review_aggregate(self, user, aggregate):
-        if is_platform_admin(user):
-            return True
-        if getattr(user, 'role', None) != 'manager':
-            return False
-        return int(aggregate.organization_id) in self._get_manager_scope_ids(user)
-
-    def _append_audit_note(self, aggregate, label, note):
-        detail = (note or '').strip()
-        entry = f"{label}: {detail}" if detail else label
-        aggregate.notes = "\n".join(filter(None, [aggregate.notes.strip(), entry])).strip()
     
     def get_queryset(self):
+        queryset = Aggregate.objects.select_related(
+            'indicator', 'project', 'organization', 'created_by', 'reviewed_by'
+        )
         user = self.request.user
-        base_queryset = Aggregate.objects.select_related(
-            'indicator',
-            'project',
-            'organization',
-            'created_by',
-            'reviewed_by',
-        )
-        if self.action == 'retrieve':
-            base_queryset = base_queryset.prefetch_related('history_entries__changed_by')
-        if is_platform_admin(user):
-            return base_queryset
-        elif getattr(user, 'role', None) == 'manager' and user.organization:
-            return base_queryset.filter(organization_id__in=self._get_manager_scope_ids(user))
-        elif user.organization:
-            return base_queryset.filter(organization=user.organization)
-        return base_queryset.none()
-
-    def get_serializer_class(self):
-        if self.action == 'retrieve':
-            return AggregateSerializer
-        return super().get_serializer_class()
+        if is_organization_admin(user):
+            return queryset
+        org_ids = get_user_organization_ids(user)
+        if org_ids:
+            return filter_queryset_by_org_ids(queryset, 'organization_id', org_ids)
+        return Aggregate.objects.none()
     
+    def _upsert_pending_aggregate(
+        self,
+        *,
+        indicator,
+        project,
+        organization,
+        period_start,
+        period_end,
+        value,
+        notes,
+    ):
+        existing = Aggregate.objects.filter(
+            indicator=indicator,
+            project=project,
+            organization=organization,
+            period_start=period_start,
+            period_end=period_end,
+        ).first()
+        previous_status = existing.status if existing else None
+        aggregate, created = Aggregate.objects.update_or_create(
+            indicator=indicator,
+            project=project,
+            organization=organization,
+            period_start=period_start,
+            period_end=period_end,
+            defaults={
+                'value': value,
+                'notes': notes or "",
+                'status': 'pending',
+                'reviewed_at': None,
+                'reviewed_by': None,
+                'created_by': self.request.user,
+            },
+        )
+        if previous_status == 'approved':
+            sync_project_indicator_total(aggregate.project_id, aggregate.indicator_id)
+        return aggregate, created
+
     def perform_create(self, serializer):
-        organization_id = serializer.validated_data.get('organization').id
-        if not self._can_write_organization(self.request.user, organization_id):
-            raise PermissionError('Not allowed for this organization.')
-        aggregate = serializer.save(
-            created_by=self.request.user,
-            status=Aggregate.STATUS_PENDING,
-            reviewed_at=None,
-            reviewed_by=None,
+        validated = serializer.validated_data
+        aggregate, _created = self._upsert_pending_aggregate(
+            indicator=validated['indicator'],
+            project=validated['project'],
+            organization=validated['organization'],
+            period_start=validated['period_start'],
+            period_end=validated['period_end'],
+            value=validated.get('value'),
+            notes=validated.get('notes'),
         )
-        self._record_history(
-            aggregate,
-            AggregateChangeLog.ACTION_SUBMITTED,
-            user=self.request.user,
-            comment='Aggregate submitted for coordinator review.',
-            changes=self._build_change_set({}, self._snapshot_aggregate(aggregate)),
-        )
+        serializer.instance = aggregate
+        self._notify_pending_submission(aggregate)
 
     def perform_update(self, serializer):
-        instance = self.get_object()
-        next_organization = serializer.validated_data.get('organization', instance.organization)
-        if not self._can_write_organization(self.request.user, next_organization.id):
-            raise PermissionError('Not allowed for this organization.')
-        before = self._snapshot_aggregate(instance)
-        prior_status = instance.status
-        prior_reviewer = instance.reviewed_by
+        previous_status = serializer.instance.status
         aggregate = serializer.save(
-            status=Aggregate.STATUS_PENDING,
+            status='pending',
             reviewed_at=None,
             reviewed_by=None,
         )
-        changes = self._build_change_set(before, self._snapshot_aggregate(aggregate))
-        comment = 'Aggregate updated and resubmitted for coordinator review.'
-        history_action = AggregateChangeLog.ACTION_CORRECTED if prior_status == Aggregate.STATUS_FLAGGED else AggregateChangeLog.ACTION_SUBMITTED
-        self._record_history(
-            aggregate,
-            history_action,
-            user=self.request.user,
-            comment=comment,
-            changes=changes,
-        )
-        if prior_status == Aggregate.STATUS_FLAGGED:
-            active_flag = self._set_active_flag_status(
-                aggregate,
-                'in_progress',
-                resolution_notes='Corrections submitted and awaiting coordinator review.',
-            )
-            coordinator = prior_reviewer or getattr(active_flag, 'created_by', None)
-            if coordinator and coordinator != self.request.user:
-                self._notify_user(
-                    coordinator,
-                    'Aggregate corrections submitted',
-                    (
-                        f"{aggregate.created_by.username if aggregate.created_by else 'A user'} "
-                        f"updated {aggregate.indicator.code} for {aggregate.organization.name}. "
-                        'Please review the corrections.'
-                    ),
-                    link=f"/aggregates?reviewAggregateId={aggregate.id}",
-                )
+        self._notify_pending_submission(aggregate)
+        if previous_status == 'approved' or aggregate.status == 'approved':
+            sync_project_indicator_total(aggregate.project_id, aggregate.indicator_id)
 
-    def create(self, request, *args, **kwargs):
-        try:
-            return super().create(request, *args, **kwargs)
-        except PermissionError as exc:
-            return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+    def perform_destroy(self, instance):
+        project_id = instance.project_id
+        indicator_id = instance.indicator_id
+        should_sync = instance.status == 'approved'
+        super().perform_destroy(instance)
+        if should_sync:
+            sync_project_indicator_total(project_id, indicator_id)
 
-    def update(self, request, *args, **kwargs):
-        try:
-            return super().update(request, *args, **kwargs)
-        except PermissionError as exc:
-            return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
-
-    def partial_update(self, request, *args, **kwargs):
-        try:
-            return super().partial_update(request, *args, **kwargs)
-        except PermissionError as exc:
-            return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
-
-    @action(detail=False, methods=['post'])
-    def generate_from_interactions(self, request):
-        """
-        Derive an aggregate value from Interaction Responses and optionally save:
-        - upsert DerivationRule (output_indicator -> source_indicator + condition)
-        - upsert Aggregate (output_indicator + project + organization + period)
-        """
-        serializer = GenerateFromInteractionsSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        payload = serializer.validated_data
-
-        output_indicator_id = payload['output_indicator']
-        source_indicator_id = payload['source_indicator']
-        project_id = payload['project']
-        organization_id = payload['organization']
-        period_start = payload['period_start']
-        period_end = payload['period_end']
-        operator = payload.get('operator', 'equals')
-        match_value = payload.get('match_value', None)
-        count_distinct = payload.get('count_distinct', 'respondent')
-        save_rule = payload.get('save_rule', True)
-        save_aggregate = payload.get('save_aggregate', True)
-
-        user = request.user
-        if not self._can_write_organization(user, organization_id):
-            return Response({'detail': 'Not allowed for this organization.'}, status=status.HTTP_403_FORBIDDEN)
-
-        try:
-            output_indicator = Indicator.objects.get(id=output_indicator_id)
-            source_indicator = Indicator.objects.get(id=source_indicator_id)
-        except Indicator.DoesNotExist:
-            return Response({'detail': 'Indicator not found.'}, status=status.HTTP_404_NOT_FOUND)
-
-        rule = None
-        if save_rule:
-            rule, created = DerivationRule.objects.update_or_create(
-                output_indicator=output_indicator,
-                defaults={
-                    'source_indicator': source_indicator,
-                    'operator': operator,
-                    'match_value': match_value,
-                    'count_distinct': count_distinct,
-                    'is_active': True,
-                },
-            )
-            if created and user and user.is_authenticated:
-                rule.created_by = user
-                rule.save(update_fields=['created_by'])
+    def _mark_review_state(self, aggregate, status_value):
+        previous_status = aggregate.status
+        aggregate.status = status_value
+        if status_value == 'pending':
+            aggregate.reviewed_at = None
+            aggregate.reviewed_by = None
         else:
-            rule = DerivationRule(
-                output_indicator=output_indicator,
-                source_indicator=source_indicator,
-                operator=operator,
-                match_value=match_value,
-                count_distinct=count_distinct,
-                is_active=True,
-            )
+            aggregate.reviewed_at = timezone.now()
+            aggregate.reviewed_by = self.request.user
+        aggregate.save(update_fields=['status', 'reviewed_at', 'reviewed_by', 'updated_at'])
+        self._notify_status_change(aggregate, status_value)
+        if previous_status == 'approved' or status_value == 'approved':
+            sync_project_indicator_total(aggregate.project_id, aggregate.indicator_id)
+        return aggregate
 
-        response_qs = InteractionResponse.objects.filter(
-            indicator_id=source_indicator.id,
-            interaction__date__gte=period_start,
-            interaction__date__lte=period_end,
-            interaction__respondent__organization_id=organization_id,
-        )
-        if project_id:
-            response_qs = response_qs.filter(interaction__project_id=project_id)
-
-        if operator == 'equals':
-            response_qs = response_qs.filter(value=match_value)
-        elif operator == 'not_equals':
-            response_qs = response_qs.exclude(value=match_value)
-        elif operator == 'contains':
-            response_qs = response_qs.filter(value__contains=match_value)
-
-        if count_distinct == 'interaction':
-            computed = response_qs.values('interaction_id').distinct().count()
-        else:
-            computed = response_qs.values('interaction__respondent_id').distinct().count()
-
-        aggregate_data = None
-        if save_aggregate:
-            aggregate, created = Aggregate.objects.update_or_create(
-                indicator_id=output_indicator.id,
-                project_id=project_id,
-                organization_id=organization_id,
-                period_start=period_start,
-                period_end=period_end,
-                defaults={
-                    'value': computed,
-                    'notes': f"Auto-generated from interactions on {timezone.now().date().isoformat()}",
-                    'status': Aggregate.STATUS_PENDING,
-                    'reviewed_at': None,
-                    'reviewed_by': None,
-                },
-            )
-            if created and user and user.is_authenticated:
-                aggregate.created_by = user
-                aggregate.save(update_fields=['created_by'])
-            self._record_history(
-                aggregate,
-                AggregateChangeLog.ACTION_SUBMITTED,
-                user=user,
-                comment='Aggregate generated from interactions and submitted for coordinator review.',
-                changes=self._build_change_set({}, self._snapshot_aggregate(aggregate)) if created else {},
-            )
-            aggregate_data = AggregateListSerializer(aggregate).data
-
-        return Response(
-            {
-                'computed': computed,
-                'rule': DerivationRuleSerializer(rule).data if save_rule and rule else {
-                    'output_indicator': output_indicator.id,
-                    'source_indicator': source_indicator.id,
-                    'operator': operator,
-                    'match_value': match_value,
-                    'count_distinct': count_distinct,
-                },
-                'aggregate': aggregate_data,
-            }
-        )
+    def _reporting_queryset(self):
+        queryset = self.filter_queryset(self.get_queryset())
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            statuses = [value.strip() for value in status_filter.split(',') if value.strip()]
+            if statuses:
+                return queryset.filter(status__in=statuses)
+        return queryset.filter(status='approved')
 
     def _extract_total(self, value):
         if isinstance(value, (int, float)):
@@ -456,6 +259,162 @@ class AggregateViewSet(viewsets.ModelViewSet):
             female = float(value.get('female') or 0)
             return male + female
         return 0.0
+
+    def _normalize_match_tokens(self, raw_value):
+        values = raw_value if isinstance(raw_value, list) else [raw_value]
+        tokens = set()
+        for value in values:
+            if value is None:
+                continue
+            normalized = str(value).strip().lower()
+            if normalized:
+                tokens.add(normalized)
+        return tokens
+
+    def _response_matches(self, response_value, operator, match_tokens):
+        if not match_tokens:
+            return response_value not in (None, "", [], {})
+
+        if isinstance(response_value, list):
+            response_tokens = {
+                str(item).strip().lower()
+                for item in response_value
+                if str(item).strip()
+            }
+            response_text = " ".join(sorted(response_tokens))
+        elif isinstance(response_value, dict):
+            response_tokens = {
+                str(item).strip().lower()
+                for item in response_value.values()
+                if str(item).strip()
+            }
+            response_text = json.dumps(response_value, sort_keys=True).lower()
+        else:
+            normalized = str(response_value).strip().lower() if response_value is not None else ""
+            response_tokens = {normalized} if normalized else set()
+            response_text = normalized
+
+        if operator == 'contains':
+            return any(token in response_text for token in match_tokens)
+        if operator == 'not_equals':
+            return not any(token in response_tokens for token in match_tokens)
+        return any(token in response_tokens for token in match_tokens)
+
+    @action(detail=False, methods=['post'])
+    def generate_from_interactions(self, request):
+        """Compute an aggregate from respondent interactions and optionally save it."""
+        output_indicator_id = request.data.get('output_indicator')
+        source_indicator_id = request.data.get('source_indicator')
+        project_id = request.data.get('project')
+        organization_id = request.data.get('organization')
+        period_start = request.data.get('period_start')
+        period_end = request.data.get('period_end')
+        operator = str(request.data.get('operator') or 'equals')
+        match_value = request.data.get('match_value')
+        count_distinct = str(request.data.get('count_distinct') or 'respondent')
+        save_rule = bool(request.data.get('save_rule', False))
+        save_aggregate = bool(request.data.get('save_aggregate', False))
+
+        if not all([output_indicator_id, source_indicator_id, project_id, organization_id, period_start, period_end]):
+            return Response(
+                {'detail': 'output_indicator, source_indicator, project, organization, period_start, and period_end are required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if operator not in {'equals', 'not_equals', 'contains'}:
+            return Response(
+                {'detail': 'operator must be equals, not_equals, or contains.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if count_distinct not in {'respondent', 'interaction'}:
+            return Response(
+                {'detail': 'count_distinct must be respondent or interaction.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            organization_id_int = int(organization_id)
+        except (TypeError, ValueError):
+            return Response({'detail': 'organization must be a valid id.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        allowed_org_ids = set(get_user_organization_ids(request.user) or [])
+        if not is_organization_admin(request.user) and organization_id_int not in allowed_org_ids:
+            return Response(
+                {'detail': 'You do not have permission to generate aggregates for this organization.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            output_indicator = Indicator.objects.get(id=output_indicator_id)
+        except Indicator.DoesNotExist:
+            return Response({'detail': 'Output indicator not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not Indicator.objects.filter(id=source_indicator_id).exists():
+            return Response({'detail': 'Source indicator not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not Project.objects.filter(id=project_id).exists():
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        match_tokens = self._normalize_match_tokens(match_value)
+        responses = InteractionResponse.objects.select_related(
+            'interaction',
+            'interaction__respondent',
+        ).filter(
+            indicator_id=source_indicator_id,
+            interaction__project_id=project_id,
+            interaction__respondent__organization_id=organization_id_int,
+            interaction__date__gte=period_start,
+            interaction__date__lte=period_end,
+        )
+
+        matched_responses = [
+            response
+            for response in responses
+            if self._response_matches(response.value, operator, match_tokens)
+        ]
+
+        if count_distinct == 'interaction':
+            computed = len({response.interaction_id for response in matched_responses})
+        else:
+            computed = len({response.interaction.respondent_id for response in matched_responses})
+
+        aggregate_payload = None
+        if save_aggregate:
+            aggregate, _created = self._upsert_pending_aggregate(
+                indicator=output_indicator,
+                project=Project.objects.get(id=project_id),
+                organization=Organization.objects.get(id=organization_id_int),
+                period_start=period_start,
+                period_end=period_end,
+                value={'total': computed},
+                notes=(
+                    f"Auto-calculated from source indicator {source_indicator_id} "
+                    f"using operator '{operator}' and distinct-by '{count_distinct}'."
+                ),
+            )
+            self._notify_pending_submission(aggregate)
+            aggregate_payload = AggregateSerializer(aggregate).data
+
+        return Response(
+            {
+                'computed': computed,
+                'rule': {
+                    'output_indicator': int(output_indicator_id),
+                    'output_indicator_code': output_indicator.code,
+                    'source_indicator': int(source_indicator_id),
+                    'operator': operator,
+                    'match_value': match_value,
+                    'count_distinct': count_distinct,
+                    'project': int(project_id),
+                    'organization': organization_id_int,
+                    'period_start': period_start,
+                    'period_end': period_end,
+                    'save_rule_requested': save_rule,
+                },
+                'aggregate': aggregate_payload,
+            }
+        )
     
     @action(detail=False, methods=['get'])
     def by_indicator(self, request):
@@ -464,8 +423,8 @@ class AggregateViewSet(viewsets.ModelViewSet):
         if not indicator_id:
             return Response({'error': 'indicator_id required'}, status=400)
         
-        aggregates = self.get_queryset().filter(indicator_id=indicator_id)
-        return Response(AggregateListSerializer(aggregates, many=True).data)
+        aggregates = self._reporting_queryset().filter(indicator_id=indicator_id)
+        return Response(AggregateSerializer(aggregates, many=True).data)
 
     @action(detail=False, methods=['post'])
     def bulk_create(self, request):
@@ -483,10 +442,10 @@ class AggregateViewSet(viewsets.ModelViewSet):
             )
         if not isinstance(data, list) or not data:
             return Response({'error': 'data list required'}, status=status.HTTP_400_BAD_REQUEST)
-        if not self._can_write_organization(request.user, organization_id):
-            return Response({'detail': 'Not allowed for this organization.'}, status=status.HTTP_403_FORBIDDEN)
 
-        created = []
+        results = []
+        created_count = 0
+        updated_count = 0
         try:
             with transaction.atomic():
                 for item in data:
@@ -497,161 +456,36 @@ class AggregateViewSet(viewsets.ModelViewSet):
                         'period_start': period_start,
                         'period_end': period_end,
                         'value': item.get('value'),
-                        'notes': item.get('notes') or '',
+                        'notes': item.get('notes'),
                     })
                     serializer.is_valid(raise_exception=True)
-                    aggregate = serializer.save(
-                        created_by=request.user,
-                        status=Aggregate.STATUS_PENDING,
-                        reviewed_at=None,
-                        reviewed_by=None,
+                    validated = serializer.validated_data
+                    aggregate, created = self._upsert_pending_aggregate(
+                        indicator=validated['indicator'],
+                        project=validated['project'],
+                        organization=validated['organization'],
+                        period_start=validated['period_start'],
+                        period_end=validated['period_end'],
+                        value=validated.get('value'),
+                        notes=validated.get('notes'),
                     )
-                    self._record_history(
-                        aggregate,
-                        AggregateChangeLog.ACTION_SUBMITTED,
-                        user=request.user,
-                        comment='Aggregate submitted for coordinator review.',
-                        changes=self._build_change_set({}, self._snapshot_aggregate(aggregate)),
-                    )
-                    created.append(serializer.data)
+                    if created:
+                        created_count += 1
+                    else:
+                        updated_count += 1
+                    self._notify_pending_submission(aggregate)
+                    results.append(AggregateSerializer(aggregate).data)
         except Exception as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response({'created': len(created), 'results': created}, status=status.HTTP_201_CREATED)
-
-    @action(detail=True, methods=['post'])
-    def review(self, request, pk=None):
-        aggregate = self.get_object()
-        if not self._can_review_aggregate(request.user, aggregate):
-            return Response({'detail': 'You do not have permission to review this aggregate.'}, status=status.HTTP_403_FORBIDDEN)
-
-        serializer = AggregateReviewSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        note = serializer.validated_data.get('notes', '').strip()
-
-        if aggregate.status == Aggregate.STATUS_APPROVED:
-            return Response({'detail': 'This aggregate has already been approved.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        previous_status = aggregate.status
-        aggregate.status = Aggregate.STATUS_REVIEWED
-        aggregate.reviewed_at = timezone.now()
-        aggregate.reviewed_by = request.user
-        self._append_audit_note(aggregate, 'Reviewed by coordinator', note)
-        aggregate.save(update_fields=['status', 'reviewed_at', 'reviewed_by', 'notes', 'updated_at'])
-        self._record_history(
-            aggregate,
-            AggregateChangeLog.ACTION_REVIEWED,
-            user=request.user,
-            comment=note or 'Aggregate reviewed by coordinator.',
-            changes=self._build_change_set(
-                {'status': previous_status},
-                {'status': aggregate.status},
-            ),
+        return Response(
+            {
+                'created': created_count,
+                'updated': updated_count,
+                'results': results,
+            },
+            status=status.HTTP_201_CREATED,
         )
-        return Response(AggregateSerializer(aggregate).data, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=['post'])
-    def approve(self, request, pk=None):
-        aggregate = self.get_object()
-        if not self._can_review_aggregate(request.user, aggregate):
-            return Response({'detail': 'You do not have permission to approve this aggregate.'}, status=status.HTTP_403_FORBIDDEN)
-
-        serializer = AggregateReviewSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        note = serializer.validated_data.get('notes', '').strip()
-
-        if aggregate.status != Aggregate.STATUS_REVIEWED:
-            return Response(
-                {'detail': 'This aggregate must be reviewed before it can be approved.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        aggregate.status = Aggregate.STATUS_APPROVED
-        aggregate.reviewed_at = timezone.now()
-        aggregate.reviewed_by = request.user
-        self._append_audit_note(aggregate, 'Approved by coordinator', note)
-        aggregate.save(update_fields=['status', 'reviewed_at', 'reviewed_by', 'notes', 'updated_at'])
-        self._set_active_flag_status(
-            aggregate,
-            'resolved',
-            resolution_notes='Aggregate approved after coordinator review.',
-        )
-        self._record_history(
-            aggregate,
-            AggregateChangeLog.ACTION_APPROVED,
-            user=request.user,
-            comment=note or 'Aggregate approved by coordinator.',
-            changes=self._build_change_set(
-                {'status': Aggregate.STATUS_REVIEWED},
-                {'status': aggregate.status},
-            ),
-        )
-        if aggregate.created_by and aggregate.created_by != request.user:
-            self._notify_user(
-                aggregate.created_by,
-                'Aggregate approved',
-                (
-                    f"Your aggregate for {aggregate.indicator.code} "
-                    f"({aggregate.period_start} to {aggregate.period_end}) was approved."
-                ),
-                link='/aggregates',
-            )
-        return Response(AggregateSerializer(aggregate).data, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=['post'])
-    def flag(self, request, pk=None):
-        aggregate = self.get_object()
-        if not self._can_review_aggregate(request.user, aggregate):
-            return Response({'detail': 'You do not have permission to flag this aggregate.'}, status=status.HTTP_403_FORBIDDEN)
-
-        serializer = AggregateFlagSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        reason = serializer.validated_data['reason']
-        description = serializer.validated_data.get('description', '').strip()
-        severity = serializer.validated_data.get('severity', 'medium')
-
-        reason_label = self.FLAG_REASON_LABELS.get(reason, 'Data quality issue')
-        previous_status = aggregate.status
-        created_flag = self._ensure_flag_for_correction(
-            aggregate,
-            request.user,
-            reason_label,
-            description,
-            severity,
-        )
-
-        aggregate.status = Aggregate.STATUS_FLAGGED
-        aggregate.reviewed_at = timezone.now()
-        aggregate.reviewed_by = request.user
-        flag_note = f"{reason_label} (Flag #{created_flag.id})"
-        self._append_audit_note(aggregate, 'Flagged for correction', f"{flag_note}. {description}".strip('. '))
-        aggregate.save(update_fields=['status', 'reviewed_at', 'reviewed_by', 'notes', 'updated_at'])
-        self._record_history(
-            aggregate,
-            AggregateChangeLog.ACTION_FLAGGED,
-            user=request.user,
-            comment=f"{reason_label}. {description}".strip('. '),
-            changes=self._build_change_set(
-                {'status': previous_status},
-                {'status': Aggregate.STATUS_FLAGGED},
-            ),
-        )
-        if aggregate.created_by and aggregate.created_by != request.user:
-            self._notify_user(
-                aggregate.created_by,
-                'Aggregate flagged for correction',
-                (
-                    f"Your aggregate for {aggregate.indicator.code} "
-                    f"({aggregate.period_start} to {aggregate.period_end}) was flagged. "
-                    f"{reason_label}{': ' + description if description else ''}"
-                ),
-                link=f"/aggregates?reviewAggregateId={aggregate.id}",
-            )
-        return Response(AggregateSerializer(aggregate).data, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=['post'])
-    def reject(self, request, pk=None):
-        return self.flag(request, pk=pk)
 
     @action(detail=False, methods=['get'])
     def templates(self, request):
@@ -688,7 +522,7 @@ class AggregateViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def summary(self, request):
         """Get aggregate summary by indicator."""
-        queryset = self.filter_queryset(self.get_queryset())
+        queryset = self._reporting_queryset()
         date_from = request.query_params.get('date_from')
         date_to = request.query_params.get('date_to')
         if date_from:
@@ -716,8 +550,10 @@ class AggregateViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def export(self, request):
         """Export aggregates to CSV or Excel."""
-        fmt = request.query_params.get('format', 'csv')
-        queryset = self.filter_queryset(self.get_queryset()).select_related('indicator', 'project', 'organization')
+        fmt = request.query_params.get('file_format', 'csv').lower()
+        if fmt not in {'csv', 'excel'}:
+            fmt = 'csv'
+        queryset = self._reporting_queryset().select_related('indicator', 'project', 'organization')
         date_from = request.query_params.get('date_from')
         date_to = request.query_params.get('date_to')
         if date_from:
@@ -752,9 +588,6 @@ class AggregateViewSet(viewsets.ModelViewSet):
                 'female': female if female is not None else '',
                 'total': total if total is not None else '',
                 'value_json': json.dumps(value, ensure_ascii=False) if value is not None else '',
-                'status': agg.status,
-                'reviewed_at': agg.reviewed_at.isoformat() if agg.reviewed_at else '',
-                'reviewed_by': agg.reviewed_by.username if agg.reviewed_by_id else '',
                 'notes': agg.notes or '',
             })
 
@@ -790,21 +623,144 @@ class AggregateViewSet(viewsets.ModelViewSet):
                 writer.writerow(row.values())
         return response
 
+    @action(detail=True, methods=['post'])
+    def review(self, request, pk=None):
+        """Mark an aggregate as reviewed and send it back through the approval queue."""
+        aggregate = self.get_object()
+        return Response(AggregateSerializer(self._mark_review_state(aggregate, 'reviewed')).data)
 
-class DerivationRuleViewSet(viewsets.ModelViewSet):
-    """CRUD for derivation rules (output indicator derived from interaction responses)."""
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        """Approve an aggregate so it appears in the main aggregate view."""
+        aggregate = self.get_object()
+        return Response(AggregateSerializer(self._mark_review_state(aggregate, 'approved')).data)
 
-    queryset = DerivationRule.objects.all()
-    serializer_class = DerivationRuleSerializer
-    permission_classes = [IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, OrderingFilter]
-    filterset_fields = ['output_indicator', 'source_indicator', 'is_active']
-    ordering_fields = ['updated_at', 'created_at']
-    ordering = ['-updated_at']
+    @action(detail=False, methods=['post'])
+    def bulk_approve(self, request):
+        """Approve multiple queued aggregates at once."""
+        if not is_organization_admin(request.user):
+            return Response({'error': 'admin access required'}, status=status.HTTP_403_FORBIDDEN)
 
-    def get_queryset(self):
-        return DerivationRule.objects.all()
+        raw_ids = request.data.get('ids', [])
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return Response({'error': 'ids list required'}, status=status.HTTP_400_BAD_REQUEST)
 
-    def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        aggregate_ids = []
+        for value in raw_ids:
+            try:
+                aggregate_ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
+
+        if not aggregate_ids:
+            return Response({'error': 'ids list required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        approved_count = 0
+        skipped = 0
+        affected_pairs = set()
+        reviewed_at = timezone.now()
+        with transaction.atomic():
+            aggregate_rows = list(
+                self.get_queryset().filter(
+                    id__in=aggregate_ids,
+                    status__in=['pending', 'reviewed'],
+                ).values(
+                    'id',
+                    'project_id',
+                    'indicator_id',
+                    'created_by_id',
+                    'organization_id',
+                    'organization__name',
+                    'indicator__code',
+                    'indicator__name',
+                    'period_start',
+                    'period_end',
+                )
+            )
+
+            found_ids = {row['id'] for row in aggregate_rows}
+            affected_pairs = {
+                (row['project_id'], row['indicator_id'])
+                for row in aggregate_rows
+            }
+
+            if found_ids:
+                approved_count = Aggregate.objects.filter(id__in=found_ids).update(
+                    status='approved',
+                    reviewed_at=reviewed_at,
+                    reviewed_by_id=request.user.id,
+                    updated_at=reviewed_at,
+                )
+
+            skipped = len(set(aggregate_ids) - found_ids)
+
+        for project_id, indicator_id in affected_pairs:
+            sync_project_indicator_total(project_id, indicator_id)
+
+        for row in aggregate_rows:
+            submitter_id = row.get('created_by_id')
+            if not submitter_id or submitter_id == request.user.id:
+                continue
+            submitter = User.objects.filter(id=submitter_id, is_active=True).first()
+            if not submitter:
+                continue
+            indicator_label = (row.get('indicator__code') or row.get('indicator__name') or '').strip() or f"Indicator {row.get('indicator_id')}"
+            organization_name = (row.get('organization__name') or '').strip() or f"Organization {row.get('organization_id')}"
+            context = AggregateNotificationContext(
+                aggregate_id=int(row['id']),
+                organization_id=int(row['organization_id']),
+                indicator_label=indicator_label,
+                organization_name=organization_name,
+                period_start=row['period_start'].isoformat() if row.get('period_start') else '',
+                period_end=row['period_end'].isoformat() if row.get('period_end') else '',
+            )
+            notify_aggregate_status_to_submitter(
+                context=context,
+                actor=request.user,
+                submitter=submitter,
+                status_value='approved',
+            )
+
+        return Response(
+            {
+                'approved': approved_count,
+                'skipped': skipped,
+                'results': [],
+            }
+        )
+
+    @action(detail=True, methods=['post'])
+    def flag(self, request, pk=None):
+        """Flag an aggregate for data quality review."""
+        aggregate = self.get_object()
+        reason = str(request.data.get('reason') or 'other')
+        description = str(request.data.get('description') or '').strip()
+        severity = str(request.data.get('severity') or 'medium')
+        priority_map = {
+            'low': 'low',
+            'medium': 'medium',
+            'high': 'high',
+            'critical': 'critical',
+        }
+        flag = Flag.objects.create(
+            flag_type='data_quality',
+            status='open',
+            priority=priority_map.get(severity, 'medium'),
+            title=f"Aggregate review flag: {aggregate.indicator.code or aggregate.indicator.name}",
+            description=description or f"Aggregate flagged during review ({reason}).",
+            content_type='aggregate',
+            object_id=aggregate.id,
+            organization=aggregate.organization,
+            created_by=request.user,
+        )
+        flagged_aggregate = self._mark_review_state(aggregate, 'flagged')
+        response_data = AggregateSerializer(flagged_aggregate).data
+        response_data['flag_id'] = flag.id
+        return Response(response_data)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        """Reject an aggregate so it does not appear in aggregate reporting."""
+        aggregate = self.get_object()
+        return Response(AggregateSerializer(self._mark_review_state(aggregate, 'rejected')).data)
 

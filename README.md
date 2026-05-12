@@ -134,29 +134,6 @@ python manage.py collectstatic
 gunicorn core.wsgi:application
 ```
 
-## Docker
-This repo now includes a production-style `Dockerfile` and `.dockerignore`.
-
-Build the backend image:
-```bash
-docker build -t bonaso-backend .
-```
-
-Run it against PostgreSQL:
-```bash
-docker run --rm -p 8000:8000 ^
-  -e DJANGO_SECRET_KEY=replace-me-with-a-long-random-secret ^
-  -e DEBUG=False ^
-  -e DATABASE_URL=postgres://bonaso:bonaso@host.docker.internal:5432/bonaso ^
-  -e DB_SSL_REQUIRE=False ^
-  -e ALLOWED_HOSTS=localhost,127.0.0.1 ^
-  -e CORS_ALLOWED_ORIGINS=http://localhost:3000 ^
-  -e CSRF_TRUSTED_ORIGINS=http://localhost:3000 ^
-  bonaso-backend
-```
-
-Container startup runs migrations and `collectstatic` automatically before starting Gunicorn.
-
 ## Troubleshooting
 - **401 Unauthorized**: token expired; re-login or refresh.
 - **DisallowedHost**: add host IP to `ALLOWED_HOSTS`.

@@ -5,56 +5,22 @@ Django settings for BONASO Data Portal project.
 from pathlib import Path
 from datetime import timedelta
 import os
-
-import dj_database_url
 from dotenv import load_dotenv
+import dj_database_url
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Always load .env from project root, regardless of cwd.
-dotenv_override = os.getenv('DOTENV_OVERRIDE', 'True').strip().lower() in {'1', 'true', 'yes', 'on'}
-load_dotenv(BASE_DIR / ".env", override=dotenv_override)
-
-
-def env_bool(name, default=False):
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def env_int(name, default=0):
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-DEBUG = env_bool('DEBUG', False)
+load_dotenv(BASE_DIR / ".env")
 
 # SECURITY WARNING: keep the secret key used in production secret!
-configured_secret_key = os.getenv('DJANGO_SECRET_KEY')
-if configured_secret_key:
-    SECRET_KEY = configured_secret_key
-elif DEBUG:
-    SECRET_KEY = 'django-insecure-change-this-in-development'
-else:
-    raise RuntimeError('DJANGO_SECRET_KEY must be set when DEBUG is False.')
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-change-this-in-production')
 
-if not DEBUG and (
-    SECRET_KEY.startswith('django-insecure-') or len(SECRET_KEY) < 50 or len(set(SECRET_KEY)) < 5
-):
-    raise RuntimeError('DJANGO_SECRET_KEY must be a long, random production secret when DEBUG is False.')
+# SECURITY WARNING: don't run with debug turned on in production!
+DEBUG = os.getenv('DEBUG', 'True').lower() == 'true'
 
-ALLOWED_HOSTS = [
-    host.strip()
-    for host in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
-    if host.strip()
-] or ['localhost', '127.0.0.1']
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
 # Application definition
 INSTALLED_APPS = [
@@ -127,10 +93,10 @@ if database_url:
         'default': dj_database_url.parse(
             database_url,
             conn_max_age=600,
-            ssl_require=env_bool('DB_SSL_REQUIRE', True),
+            ssl_require=os.getenv('DB_SSL_REQUIRE', 'True').lower() == 'true',
         )
     }
-elif env_bool('USE_POSTGRES', False):
+elif os.getenv('USE_POSTGRES', 'False').lower() == 'true':
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
@@ -179,15 +145,11 @@ MEDIA_ROOT = BASE_DIR / 'media'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # CORS settings
-CORS_ALLOW_ALL_ORIGINS = env_bool('CORS_ALLOW_ALL_ORIGINS', False)
-CORS_ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv(
-        'CORS_ALLOWED_ORIGINS',
-        'http://localhost:3000,http://127.0.0.1:3000'
-    ).split(',')
-    if origin.strip()
-]
+CORS_ALLOW_ALL_ORIGINS = os.getenv('CORS_ALLOW_ALL_ORIGINS', 'False').lower() == 'true'
+CORS_ALLOWED_ORIGINS = os.getenv(
+    'CORS_ALLOWED_ORIGINS',
+    'http://localhost:3000,http://127.0.0.1:3000'
+).split(',')
 CORS_ALLOW_CREDENTIALS = True
 
 CSRF_TRUSTED_ORIGINS = [
@@ -195,32 +157,6 @@ CSRF_TRUSTED_ORIGINS = [
     for origin in os.getenv('CSRF_TRUSTED_ORIGINS', '').split(',')
     if origin.strip()
 ]
-
-# Security settings
-USE_X_FORWARDED_PROTO = env_bool('USE_X_FORWARDED_PROTO', not DEBUG)
-if USE_X_FORWARDED_PROTO:
-    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-
-SECURE_SSL_REDIRECT = env_bool('SECURE_SSL_REDIRECT', not DEBUG)
-SESSION_COOKIE_SECURE = env_bool('SESSION_COOKIE_SECURE', not DEBUG)
-CSRF_COOKIE_SECURE = env_bool('CSRF_COOKIE_SECURE', not DEBUG)
-SESSION_COOKIE_SAMESITE = os.getenv('SESSION_COOKIE_SAMESITE', 'Lax')
-CSRF_COOKIE_SAMESITE = os.getenv('CSRF_COOKIE_SAMESITE', 'Lax')
-SECURE_HSTS_SECONDS = env_int('SECURE_HSTS_SECONDS', 31536000 if not DEBUG else 0)
-SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool(
-    'SECURE_HSTS_INCLUDE_SUBDOMAINS',
-    SECURE_HSTS_SECONDS > 0 and not DEBUG,
-)
-SECURE_HSTS_PRELOAD = env_bool(
-    'SECURE_HSTS_PRELOAD',
-    SECURE_HSTS_SECONDS > 0 and not DEBUG,
-)
-SECURE_CONTENT_TYPE_NOSNIFF = env_bool('SECURE_CONTENT_TYPE_NOSNIFF', True)
-SECURE_REFERRER_POLICY = os.getenv(
-    'SECURE_REFERRER_POLICY',
-    'strict-origin-when-cross-origin' if not DEBUG else 'same-origin',
-)
-X_FRAME_OPTIONS = os.getenv('X_FRAME_OPTIONS', 'DENY')
 
 # REST Framework settings
 REST_FRAMEWORK = {

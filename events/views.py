@@ -5,7 +5,9 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.utils import timezone
-from django.db.models import Count, Sum
+from django.db import models
+from django.db.models import Count, Sum, Prefetch
+from organizations.access import get_user_organization_ids, is_organization_admin, filter_queryset_by_org_ids
 
 from .models import Event, Participant, EventPhase
 from .serializers import (
@@ -34,11 +36,29 @@ class EventViewSet(viewsets.ModelViewSet):
         return EventSerializer
     
     def get_queryset(self):
+        queryset = Event.objects.select_related(
+            'project', 'organization', 'created_by'
+        ).prefetch_related(
+            'participating_organizations', 'indicators'
+        ).annotate(
+            participants_count=Count('participants', distinct=True)
+        )
+
+        if self.action == 'retrieve':
+            queryset = queryset.prefetch_related(
+                Prefetch(
+                    'participants',
+                    queryset=Participant.objects.select_related('respondent'),
+                ),
+                'phases',
+            )
+
         user = self.request.user
-        if user.is_superuser or user.is_staff or user.role == 'admin':
-            return Event.objects.all()
-        elif user.organization:
-            return Event.objects.filter(organization=user.organization)
+        if is_organization_admin(user):
+            return queryset
+        org_ids = get_user_organization_ids(user)
+        if org_ids:
+            return filter_queryset_by_org_ids(queryset, 'organization_id', org_ids)
         return Event.objects.none()
     
     def perform_create(self, serializer):
@@ -126,6 +146,16 @@ class ParticipantViewSet(viewsets.ModelViewSet):
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['event', 'attended']
 
+    def get_queryset(self):
+        user = self.request.user
+        queryset = Participant.objects.select_related('event')
+        if is_organization_admin(user):
+            return queryset
+        org_ids = get_user_organization_ids(user)
+        if org_ids:
+            return filter_queryset_by_org_ids(queryset, 'event__organization_id', org_ids)
+        return queryset.none()
+
     @action(detail=True, methods=['post'])
     def mark_attendance(self, request, pk=None):
         """Mark attendance for a participant."""
@@ -149,6 +179,16 @@ class EventPhaseViewSet(viewsets.ModelViewSet):
     filterset_fields = ['event', 'status']
     ordering_fields = ['due_date', 'created_at', 'title']
     ordering = ['-created_at']
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = EventPhase.objects.select_related('event')
+        if is_organization_admin(user):
+            return queryset
+        org_ids = get_user_organization_ids(user)
+        if org_ids:
+            return filter_queryset_by_org_ids(queryset, 'event__organization_id', org_ids)
+        return queryset.none()
 
 
 class EventCheckinViewSet(viewsets.ViewSet):

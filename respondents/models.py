@@ -70,13 +70,6 @@ class Interaction(models.Model):
         blank=True,
         related_name='interactions'
     )
-    event = models.ForeignKey(
-        'events.Event',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='interactions'
-    )
     
     date = models.DateField()
     notes = models.TextField(blank=True)

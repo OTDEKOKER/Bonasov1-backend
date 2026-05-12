@@ -40,9 +40,15 @@ class OrganizationSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
     
     def get_children_count(self, obj):
+        annotated_count = getattr(obj, 'children_count', None)
+        if annotated_count is not None:
+            return annotated_count
         return obj.children.count()
     
     def get_users_count(self, obj):
+        annotated_count = getattr(obj, 'users_count', None)
+        if annotated_count is not None:
+            return annotated_count
         return obj.users.count()
 
 

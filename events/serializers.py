@@ -41,6 +41,9 @@ class EventSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at', 'created_by']
     
     def get_participants_count(self, obj):
+        annotated_count = getattr(obj, 'participants_count', None)
+        if annotated_count is not None:
+            return annotated_count
         return obj.participants.count()
     
     def get_attendance_rate(self, obj):

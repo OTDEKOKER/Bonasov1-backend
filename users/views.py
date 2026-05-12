@@ -1,42 +1,37 @@
+﻿from rest_framework import viewsets, status, generics
+from rest_framework.decorators import api_view, permission_classes, action
+from rest_framework.permissions import IsAuthenticated, AllowAny, IsAdminUser
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework import generics, status, viewsets
-from rest_framework.decorators import action, api_view, permission_classes
-from rest_framework.filters import OrderingFilter, SearchFilter
-from rest_framework.permissions import AllowAny, IsAuthenticated
-from rest_framework.response import Response
-from rest_framework.throttling import AnonRateThrottle
-from rest_framework.views import APIView
-from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework.filters import SearchFilter, OrderingFilter
+from organizations.access import get_user_organization_ids, is_organization_admin, filter_queryset_by_org_ids
 
-from core.permissions import IsPlatformAdmin, is_platform_admin
 from .models import UserActivity
 from .serializers import (
-    AdminResetPasswordSerializer,
-    EmailOrUsernameTokenObtainPairSerializer,
-    PasswordChangeSerializer,
-    PermissionOptionSerializer,
-    resolve_login_user,
-    UserActivitySerializer,
-    UserCreateSerializer,
-    UserSerializer,
-    UserUpdateSerializer,
-    get_assignable_permissions_queryset,
+    UserSerializer, UserCreateSerializer, UserUpdateSerializer,
+    PasswordChangeSerializer, AdminResetPasswordSerializer, UserActivitySerializer,
+    CurrentUserDashboardPreferencesSerializer,
 )
 
 User = get_user_model()
 
 
+# ---------------------------
+# JWT Token Views
+# ---------------------------
 class CookieTokenObtainPairView(TokenObtainPairView):
     """Custom login view that logs user activity."""
-    serializer_class = EmailOrUsernameTokenObtainPairSerializer
 
     def post(self, request, *args, **kwargs):
         response = super().post(request, *args, **kwargs)
         if response.status_code == 200:
-            user = resolve_login_user(request.data.get('username') or request.data.get('email'))
+            user = User.objects.filter(username=request.data.get('username')).first()
             if user:
                 user.last_activity = timezone.now()
                 user.save(update_fields=['last_activity'])
@@ -57,12 +52,24 @@ class CookieTokenRefreshView(TokenRefreshView):
     pass
 
 
-@api_view(['GET'])
+# ---------------------------
+# Auth & User Endpoints
+# ---------------------------
+@api_view(['GET', 'PATCH'])
 @permission_classes([IsAuthenticated])
 def current_user(request):
-    """Return currently logged-in user details."""
-    serializer = UserSerializer(request.user)
-    return Response(serializer.data)
+    """Return or update currently logged-in user details."""
+    if request.method == 'PATCH':
+        serializer = CurrentUserDashboardPreferencesSerializer(
+            request.user,
+            data=request.data,
+            partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+    response_serializer = UserSerializer(request.user)
+    return Response(response_serializer.data)
 
 
 @api_view(['POST'])
@@ -97,12 +104,11 @@ class ApplyForNewUser(generics.CreateAPIView):
     """Create new user account."""
     serializer_class = UserCreateSerializer
     permission_classes = [AllowAny]
-    throttle_classes = [AnonRateThrottle]
 
 
 class AdminResetPasswordView(APIView):
     """Admin can reset a user's password."""
-    permission_classes = [IsPlatformAdmin]
+    permission_classes = [IsAdminUser]
 
     def post(self, request):
         serializer = AdminResetPasswordSerializer(data=request.data)
@@ -124,45 +130,40 @@ class AdminResetPasswordView(APIView):
             return Response({'detail': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
 
 
+# ---------------------------
+# User Management ViewSet
+# ---------------------------
 class UserViewSet(viewsets.ModelViewSet):
     """CRUD for users."""
-
-    queryset = User.objects.all().prefetch_related('user_permissions__content_type')
+    queryset = User.objects.all()
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['role', 'organization', 'is_active']
     search_fields = ['username', 'email', 'first_name', 'last_name']
     ordering_fields = ['username', 'created_at', 'last_activity']
     ordering = ['-created_at']
-    permission_classes = [IsAuthenticated]
 
-    def get_permissions(self):
-        if self.action in ['create', 'destroy', 'deactivate', 'activate', 'permissions']:
-            return [IsPlatformAdmin()]
-        return [IsAuthenticated()]
+    # For testing, allow unauthenticated; change to IsAuthenticated in production
+    permission_classes = [IsAuthenticated]
 
     def get_serializer_class(self):
         if self.action == 'create':
             return UserCreateSerializer
-        if self.action in ['update', 'partial_update']:
+        elif self.action in ['update', 'partial_update']:
             return UserUpdateSerializer
         return UserSerializer
 
     def get_queryset(self):
         """Filter queryset based on user role."""
+        queryset = User.objects.select_related('organization')
         user = self.request.user
-        if user.is_superuser or user.is_staff or user.role == 'admin':
-            return User.objects.all().prefetch_related('user_permissions__content_type')
+        if is_organization_admin(user):
+            return queryset
         if user.role == 'manager':
-            return User.objects.filter(organization=user.organization).prefetch_related(
-                'user_permissions__content_type'
-            )
-        return User.objects.filter(id=user.id).prefetch_related('user_permissions__content_type')
-
-    @action(detail=False, methods=['get'])
-    def permissions(self, request):
-        """Return assignable user permissions for admin screens."""
-        serializer = PermissionOptionSerializer(get_assignable_permissions_queryset(), many=True)
-        return Response(serializer.data)
+            org_ids = get_user_organization_ids(user)
+            if org_ids:
+                return filter_queryset_by_org_ids(queryset, 'organization_id', org_ids)
+            return queryset.none()
+        return queryset.filter(id=user.id)
 
     @action(detail=True, methods=['post'])
     def deactivate(self, request, pk=None):
@@ -188,11 +189,34 @@ class UserViewSet(viewsets.ModelViewSet):
         serializer = UserActivitySerializer(activities, many=True)
         return Response(serializer.data)
 
+    @action(detail=False, methods=['get'])
+    def permissions(self, request):
+        """Return assignable permissions for admins."""
+        user = request.user
+        if not (user.is_superuser or user.is_staff or user.role == 'admin'):
+            return Response({'detail': 'You do not have permission to view permissions.'}, status=status.HTTP_403_FORBIDDEN)
 
+        permissions = Permission.objects.select_related('content_type').order_by(
+            'content_type__app_label', 'codename'
+        )
+        payload = [
+            {
+                'id': str(permission.id),
+                'app_label': permission.content_type.app_label,
+                'codename': permission.codename,
+                'name': permission.name,
+            }
+            for permission in permissions
+        ]
+        return Response(payload)
+
+
+# ---------------------------
+# User Activity ViewSet
+# ---------------------------
 class UserActivityViewSet(viewsets.ReadOnlyModelViewSet):
     """Read-only view for user activities."""
-
-    queryset = UserActivity.objects.all()
+    queryset = UserActivity.objects.select_related('user')
     serializer_class = UserActivitySerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, OrderingFilter]
@@ -201,8 +225,13 @@ class UserActivityViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if is_platform_admin(user):
-            return UserActivity.objects.all()
-        if getattr(user, 'role', None) == 'manager' and user.organization_id:
-            return UserActivity.objects.filter(user__organization_id=user.organization_id)
-        return UserActivity.objects.filter(user=user)
+        queryset = UserActivity.objects.select_related('user')
+        if is_organization_admin(user):
+            return queryset
+        if user.role == 'manager':
+            org_ids = get_user_organization_ids(user)
+            if org_ids:
+                return filter_queryset_by_org_ids(queryset, 'user__organization_id', org_ids)
+            return queryset.none()
+        return queryset.filter(user=user)
+

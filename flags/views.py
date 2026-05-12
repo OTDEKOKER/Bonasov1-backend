@@ -2,13 +2,12 @@
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.exceptions import PermissionDenied
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.utils import timezone
 from django.db import models
+from organizations.access import get_user_organization_ids, is_organization_admin, filter_queryset_by_org_ids
 
-from core.permissions import is_platform_admin
 from .models import Flag, FlagComment
 from .serializers import FlagSerializer, FlagCommentSerializer
 
@@ -27,33 +26,15 @@ class FlagViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if is_platform_admin(user):
+        if is_organization_admin(user):
             return Flag.objects.all()
-        elif user.organization:
-            return Flag.objects.filter(organization=user.organization)
+        org_ids = get_user_organization_ids(user)
+        if org_ids:
+            return filter_queryset_by_org_ids(Flag.objects.all(), 'organization_id', org_ids)
         return Flag.objects.filter(created_by=user)
     
     def perform_create(self, serializer):
-        user = self.request.user
-        organization = serializer.validated_data.get('organization')
-        if not is_platform_admin(user):
-            if not user.organization_id:
-                raise PermissionDenied('You must belong to an organization to create flags.')
-            if organization and organization.id != user.organization_id:
-                raise PermissionDenied('You can only create flags in your organization.')
-            serializer.save(created_by=user, organization=user.organization)
-            return
-        serializer.save(created_by=user)
-
-    def perform_update(self, serializer):
-        user = self.request.user
-        organization = serializer.validated_data.get('organization', serializer.instance.organization)
-        if not is_platform_admin(user):
-            if not user.organization_id or organization.id != user.organization_id:
-                raise PermissionDenied('You can only update flags in your organization.')
-            serializer.save(organization=user.organization)
-            return
-        serializer.save()
+        serializer.save(created_by=self.request.user)
     
     @action(detail=True, methods=['post'])
     def resolve(self, request, pk=None):
@@ -114,17 +95,14 @@ class FlagCommentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if is_platform_admin(user):
-            return FlagComment.objects.all()
-        if user.organization_id:
-            return FlagComment.objects.filter(flag__organization_id=user.organization_id)
-        return FlagComment.objects.filter(created_by=user)
+        queryset = FlagComment.objects.select_related('flag', 'created_by')
+        if is_organization_admin(user):
+            return queryset
+        org_ids = get_user_organization_ids(user)
+        if org_ids:
+            return filter_queryset_by_org_ids(queryset, 'flag__organization_id', org_ids)
+        return queryset.filter(created_by=user)
     
     def perform_create(self, serializer):
-        user = self.request.user
-        flag = serializer.validated_data['flag']
-        if not is_platform_admin(user):
-            if not user.organization_id or flag.organization_id != user.organization_id:
-                raise PermissionDenied('You can only comment on flags in your organization.')
-        serializer.save(created_by=user)
+        serializer.save(created_by=self.request.user)
 

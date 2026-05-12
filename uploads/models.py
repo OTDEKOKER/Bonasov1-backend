@@ -56,7 +56,7 @@ class Upload(models.Model):
             ext = os.path.splitext(self.file.name)[1].lower()
             if ext in ['.jpg', '.jpeg', '.png', '.gif']:
                 self.file_type = 'image'
-            elif ext in ['.xlsx', '.xls', '.csv']:
+            elif ext in ['.xlsx', '.xls', '.xlsm', '.csv']:
                 self.file_type = 'spreadsheet'
             elif ext in ['.pdf', '.doc', '.docx']:
                 self.file_type = 'document'
@@ -68,8 +68,13 @@ class ImportJob(models.Model):
     
     STATUS_CHOICES = [
         ('pending', 'Pending'),
+        ('uploaded', 'Uploaded'),
+        ('analyzing', 'Analyzing'),
+        ('ready_for_review', 'Ready for Review'),
         ('processing', 'Processing'),
+        ('validated', 'Validated'),
         ('completed', 'Completed'),
+        ('imported', 'Imported'),
         ('failed', 'Failed'),
     ]
     
@@ -99,109 +104,3 @@ class ImportJob(models.Model):
     
     def __str__(self):
         return f"Import: {self.upload.name} ({self.status})"
-
-
-class WorkbookTemplate(models.Model):
-    """Stored workbook template metadata for report workbook imports/exports."""
-
-    name = models.CharField(max_length=255)
-    workbook_family = models.CharField(max_length=100, blank=True, null=True)
-    report_category = models.CharField(max_length=100, blank=True, null=True)
-    version = models.PositiveIntegerField(default=1)
-    is_active = models.BooleanField(default=True)
-    expected_headers = models.JSONField(default=list, blank=True)
-    row_labels = models.JSONField(default=list, blank=True)
-    column_labels = models.JSONField(default=list, blank=True)
-    source_upload = models.ForeignKey(
-        Upload,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='workbook_templates',
-    )
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    created_by = models.ForeignKey(
-        'users.User',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='created_workbook_templates',
-    )
-
-    class Meta:
-        ordering = ['name', '-version', '-created_at']
-
-    def __str__(self):
-        return f"{self.name} v{self.version}"
-
-
-class WorkbookExportJob(models.Model):
-    """Generated workbook export jobs and downloadable output files."""
-
-    STATUS_CHOICES = [
-        ('pending', 'Pending'),
-        ('processing', 'Processing'),
-        ('completed', 'Completed'),
-        ('failed', 'Failed'),
-    ]
-    SCOPE_CHOICES = [
-        ('single_organization', 'Single organization'),
-        ('coordinator', 'Coordinator'),
-        ('all_organizations', 'All organizations'),
-        ('consolidated', 'Consolidated'),
-    ]
-
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
-    scope = models.CharField(max_length=30, choices=SCOPE_CHOICES)
-    reporting_period = models.CharField(max_length=100)
-    financial_year_start_month = models.PositiveSmallIntegerField(default=4)
-    project = models.ForeignKey(
-        'projects.Project',
-        on_delete=models.CASCADE,
-        related_name='workbook_export_jobs',
-    )
-    template = models.ForeignKey(
-        WorkbookTemplate,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='export_jobs',
-    )
-    generated_upload = models.ForeignKey(
-        Upload,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='generated_workbook_exports',
-    )
-    organization = models.ForeignKey(
-        'organizations.Organization',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='organization_workbook_exports',
-    )
-    coordinator = models.ForeignKey(
-        'organizations.Organization',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='coordinator_workbook_exports',
-    )
-    errors = models.JSONField(default=list, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    completed_at = models.DateTimeField(null=True, blank=True)
-    created_by = models.ForeignKey(
-        'users.User',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='workbook_export_jobs',
-    )
-
-    class Meta:
-        ordering = ['-created_at']
-
-    def __str__(self):
-        return f"Workbook export {self.project_id} {self.reporting_period} ({self.status})"
